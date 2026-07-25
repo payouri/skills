@@ -9,6 +9,22 @@ Pass `args: { epic: <number>, repo: "<owner>/<repo>", featureBranch: "feature/ep
 the `Workflow` call. Create `featureBranch` off `trunk` yourself (a local branch, no push) before
 invoking, if it doesn't already exist.
 
+> **Known issue — `args` may arrive JSON-stringified.** Observed repeatedly across separate projects
+> and invocations (with and without `resumeFromRunId`): the object passed as `args` reaches the script
+> as a *string* holding its JSON. `args` is the only `Workflow` input with no declared type, so nothing
+> enforces object-ness. The script normalizes for this (parse-if-string, below) and hard-fails if the
+> result is still incomplete — but if you see it recur, **skip `args` entirely and inline the config as
+> literals** in the script instead:
+>
+> ```js
+> const cfg = { epic: 42, repo: 'owner/repo', featureBranch: 'feature/epic-42' }
+> ```
+>
+> then destructure from `cfg` rather than `input`. Workflow persists a script per invocation and you
+> iterate via `scriptPath` anyway, so a per-epic literal costs nothing in reusability. Keep the guard
+> when you do this, but understand what it becomes: checked against literals it can no longer catch a
+> transport failure — only a typo, which is still worth catching for the protected-branch case.
+
 ```js
 export const meta = {
   name: 'orchestrate-implementation',
@@ -84,18 +100,30 @@ const REVIEW_SCHEMA = {
   required: ['landed', 'hitl'],
 }
 
-// Fail fast: a missing/mismatched arg must never silently become the string "undefined"
-// inside a prompt. That's what turns into an agent improvising a merge target.
-const PROTECTED_BRANCHES = ['trunk', 'main', 'master']
-if (!args?.epic || !args?.repo || !args?.featureBranch) {
+// `args` can arrive JSON-stringified instead of as an object (observed in practice — `args` is the
+// one Workflow input with no declared type, so nothing enforces object-ness). On a string, EVERY
+// property read yields undefined, which then interpolates into prompts as the literal text
+// "undefined" — silent, not a TypeError. Normalize first, then fail fast on whatever's still missing.
+let input
+try {
+  input = typeof args === 'string' ? JSON.parse(args) : args
+} catch {
   throw new Error(
-    `orchestrate-implementation requires args.epic, args.repo, args.featureBranch — got ${JSON.stringify(args)}. ` +
-      `Fix the Workflow call's args and retry; do not let the fleet run against undefined targets.`
+    `orchestrate-implementation got an args string it could not parse: ${String(args).slice(0, 200)}`
   )
 }
-if (PROTECTED_BRANCHES.includes(args.featureBranch)) {
+const { epic, repo, featureBranch } = input ?? {}
+const PROTECTED_BRANCHES = ['trunk', 'main', 'master']
+if (!epic || !repo || !featureBranch) {
   throw new Error(
-    `args.featureBranch ("${args.featureBranch}") is a protected branch — sub-tasks must never land directly on it.`
+    `orchestrate-implementation requires epic, repo, featureBranch — got ${JSON.stringify(args)} ` +
+      `(typeof ${typeof args}). Fix the Workflow call's args and retry; never let the fleet run against ` +
+      `undefined targets.`
+  )
+}
+if (PROTECTED_BRANCHES.includes(featureBranch)) {
+  throw new Error(
+    `featureBranch ("${featureBranch}") is a protected branch — sub-tasks must never land directly on it.`
   )
 }
 
@@ -108,13 +136,13 @@ while (round < MAX_ROUNDS) {
   round++
   phase('Discover')
   const discovery = await agent(
-    `Repo ${args.repo}. First confirm epic #${args.epic} exists and is open (gh issue view ${args.epic}). If it ` +
+    `Repo ${repo}. First confirm epic #${epic} exists and is open (gh issue view ${epic}). If it ` +
       `does not exist, or you cannot confirm it, set epicFound=false and return an empty subtasks array — do ` +
       `NOT substitute a similar-looking issue from a different epic. If confirmed, read ` +
       `docs/agents/issue-tracker.md if it exists and follow its child-discovery and blocking conventions ` +
       `(e.g. its "frontier query" recipe) exactly. If it doesn't exist, use plain gh: children of epic ` +
-      `#${args.epic} are issues linked via gh's native sub-issue API, or failing that issues whose body ` +
-      `contains "Part of #${args.epic}"; an issue is blocked if it has an open native issue dependency (gh api ` +
+      `#${epic} are issues linked via gh's native sub-issue API, or failing that issues whose body ` +
+      `contains "Part of #${epic}"; an issue is blocked if it has an open native issue dependency (gh api ` +
       `.../issues/<n> — check issue_dependencies_summary.blocked_by > 0) or an open issue referenced in a ` +
       `"Blocked by:" line in its body. Return only children that are open, unblocked, and unassigned (an ` +
       `assignee means another round's pipeline already has it in flight — skip it, don't re-claim it). For ` +
@@ -125,7 +153,7 @@ while (round < MAX_ROUNDS) {
   )
 
   if (!discovery.epicFound) {
-    throw new Error(`Discover could not confirm epic #${args.epic} exists in ${args.repo} — stopping before claiming anything.`)
+    throw new Error(`Discover could not confirm epic #${epic} exists in ${repo} — stopping before claiming anything.`)
   }
 
   if (!discovery.subtasks.length) {
@@ -137,9 +165,9 @@ while (round < MAX_ROUNDS) {
     discovery.subtasks,
     (task) =>
       agent(
-        `Claim GitHub issue #${task.number} in ${args.repo}: gh issue edit ${task.number} --add-assignee @me. ` +
-          `Then confirm branch "${args.featureBranch}" actually exists locally (git rev-parse --verify ` +
-          `${args.featureBranch}). If it does not exist, set ok=false with a reason and stop there — do NOT ` +
+        `Claim GitHub issue #${task.number} in ${repo}: gh issue edit ${task.number} --add-assignee @me. ` +
+          `Then confirm branch "${featureBranch}" actually exists locally (git rev-parse --verify ` +
+          `${featureBranch}). If it does not exist, set ok=false with a reason and stop there — do NOT ` +
           `fall back to trunk, main, master, or any invented branch name, no matter how plausible it looks. ` +
           `If it exists, create a git worktree for this sub-task at ../wt-subtask-${task.number} on new branch ` +
           `subtask-${task.number} based on it, set ok=true, and return the worktree path and branch name.`,
@@ -168,15 +196,15 @@ while (round < MAX_ROUNDS) {
       agent(
         `Reviewing sub-task #${task.number}. Use the SAME worktree the implementer used — do not create ` +
           `a new one: ${impl.worktreePath}, branch ${impl.branch}. You did not write this code; read the ` +
-          `handoff below, then run /code-review against ${args.featureBranch}. Fix any findings yourself — ` +
+          `handoff below, then run /code-review against ${featureBranch}. Fix any findings yourself — ` +
           `the implementer does not get a second pass. The ONLY valid merge target is the exact branch ` +
-          `"${args.featureBranch}" — it is never trunk/main/master and you must never substitute one of those ` +
+          `"${featureBranch}" — it is never trunk/main/master and you must never substitute one of those ` +
           `or invent a different name, even as a fallback. Before merging, re-verify with git rev-parse ` +
-          `--verify ${args.featureBranch} that it still exists and is what you think it is. If it's missing, ` +
+          `--verify ${featureBranch} that it still exists and is what you think it is. If it's missing, ` +
           `looks wrong, or a fix would require an irreversible/high-blast-radius action, or a rebase/merge ` +
           `conflict against it can't be resolved after a genuine attempt, STOP without merging anything ` +
           `anywhere and report hitl.triggered=true with why. Otherwise: squash to one tidy commit, rebase ` +
-          `onto ${args.featureBranch}, merge --ff-only into ${args.featureBranch}. Then comment on issue ` +
+          `onto ${featureBranch}, merge --ff-only into ${featureBranch}. Then comment on issue ` +
           `#${task.number} with the commit link and a short summary, close it, and remove the worktree (git ` +
           `worktree remove ${impl.worktreePath} --force). Never push or open a PR.\n\nHandoff:\n${impl.handoff}`,
         { phase: 'Review & Fix', schema: REVIEW_SCHEMA, label: `review:${task.number}`, model: 'opus' }
@@ -194,8 +222,8 @@ if (round === MAX_ROUNDS) log(`Hit the ${MAX_ROUNDS}-round safety cap — some s
 
 phase('Discrepancy check')
 const discrepancies = await agent(
-  `Compare epic #${args.epic}'s spec (title, body, acceptance criteria) in ${args.repo} against what ` +
-    `actually landed on ${args.featureBranch} (git log/diff against its merge-base with trunk, plus the ` +
+  `Compare epic #${epic}'s spec (title, body, acceptance criteria) in ${repo} against what ` +
+    `actually landed on ${featureBranch} (git log/diff against its merge-base with trunk, plus the ` +
     `closed sub-issues and their summary comments). Report anything specified but not delivered, delivered ` +
     `but not specified, or diverging from the spec's intent.`,
   { schema: { type: 'object', properties: { discrepancies: { type: 'string' } }, required: ['discrepancies'] } }
@@ -232,10 +260,18 @@ return { landed, hitl, discrepancies: discrepancies.discrepancies, roundsUsed: r
   the epic's existence is checked before Discover returns anything; the feature branch's existence is
   checked before Claim creates a worktree, and re-checked before Review merges. This is deliberate,
   not defensive boilerplate: a first run of this template hit exactly the failure mode these checks
-  close — `args.featureBranch` didn't reach the script (a key-name mismatch between the `Workflow`
-  call's `args` and what the script reads), every prompt silently interpolated the string `"undefined"`
-  instead of throwing, and six review agents responded to an unresolvable merge target by defaulting
+  close — `args` arrived **JSON-stringified rather than as an object** (confirmed from the persisted
+  run record: `args` was a `str` holding `'{"epic": 109, ...}'`). The keys were all correct; the
+  container wasn't. On a string primitive every property read returns `undefined` rather than
+  throwing, so every prompt silently interpolated the literal text `"undefined"`, and six review
+  agents responded to an unresolvable merge target by defaulting
   to `trunk` — exactly the branch the skill's rules forbid touching — while a seventh, faced with the
   same broken input, correctly refused trunk but landed on an orphaned branch instead. A missing or
   malformed `args` field, or a merge target that isn't verifiably the real `featureBranch`, must stop
   the fleet (or that one sub-task) outright — it must never be treated as "good enough, proceed."
+- **Read `args` through the normalizer, never directly.** The script destructures `epic`/`repo`/
+  `featureBranch` once at the top and interpolates those bindings; `args` itself is referenced only
+  in the error message. `args` is the sole `Workflow` input with no declared type in its schema, so
+  nothing upstream guarantees it arrives as an object — a stringified value is a live possibility on
+  any run, not a one-off. If you add a new field, destructure it up there too rather than reaching
+  for `args.newField` mid-script, or you reintroduce the silent-`undefined` hole for that one field.
