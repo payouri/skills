@@ -69,12 +69,19 @@ tracker conventions rather than copying it verbatim.
   `pipeline()`/`parallel()` alone would run up to Workflow's own cap of ~16.
 - **One worktree per issue, reused across implement → review → fix.** Never shared between two
   concurrent issues — a worktree can only have one branch checked out.
-- **Worktree removed, branch kept.** Every worktree is disposed once its commit exists
-  (`git worktree remove` + `git worktree prune`); the branch survives for the human. Removal requires
-  a clean worktree, which is the check that no work is being thrown away — never `--force` past it.
+- **The run ends as branches and nothing else.** Every exit path — success *and* HITL — commits its
+  work to the issue's branch and disposes of the checkout, so `git worktree list` is back to the
+  primary checkout when the fleet stops. This holds because nothing is ever discarded to achieve it:
+  leftover uncommitted work becomes a marked `chore(wip)` commit on the branch (reported as
+  unreviewed), and `--force` is banned — a `git worktree remove` refusal means the commit step isn't
+  finished, so finish it rather than force past it. Branches are never deleted; they're the deliverable.
+- **A final Sweep phase verifies that invariant, rather than trusting it.** Every claim registers its
+  worktree; the Sweep reconciles that list against `git worktree list`, recovers any stragglers' work
+  onto their branches, and disposes of what's left. It runs even when every lane failed — that's when
+  the most is stranded.
 - **HITL escalation, not a workaround**, when an issue hits a security/destructive-action concern, or
-  a rebase/conflict the reviewer can't resolve after a genuine attempt. Leave the issue open, record
-  why, keep the rest of the fleet going.
+  a rebase/conflict the reviewer can't resolve after a genuine attempt. Stop *fixing*, record why,
+  keep the rest of the fleet going — but still commit and still dispose, per the rule above.
 - **A dead agent degrades one lane, never the fleet.** `agent()` returns `null` rather than throwing
   when a subagent dies, and a provider-side overload kills every in-flight agent at once. Null-check
   every stage inside the lane, let nothing after the pool dereference an unchecked value, and back off
@@ -93,9 +100,12 @@ prompts byte-identical or they re-run live. Full procedure in [REFERENCE.md](REF
 Once the workflow returns, give the user exactly four sections:
 
 - **Branches ready to land** — one line per issue: `#<n> <title>` → branch, commit SHA, one-line
-  summary. This is the main deliverable; the user integrates from it.
+  summary. This is the main deliverable; the user integrates from it. Flag any branch carrying a
+  `chore(wip)` residual commit — that part is unreviewed.
 - **Spec discrepancies** — per issue, anything the reviewer found specified-but-undelivered or
   delivered-but-unspecified.
-- **HITL escalations** — every issue that stopped short of a commit and why, or "none".
-- **Summary** — issues attempted, models used, rounds run, whether the round cap was hit, and any
-  worktree or branch left behind that the user should sweep.
+- **HITL escalations** — every issue whose review stopped early and why, or "none". Their work is on
+  their branch too; say what state it's in.
+- **Summary** — issues attempted, models used, rounds run, whether the round cap was hit, and the
+  Sweep result. State plainly whether `git worktree list` is clean; if anything survived, name the
+  paths rather than implying a tidy finish.

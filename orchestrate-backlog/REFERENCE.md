@@ -32,6 +32,7 @@ export const meta = {
     { title: 'Claim' },
     { title: 'Implement' },
     { title: 'Review & Fix', model: 'opus' },
+    { title: 'Sweep' },
   ],
 }
 
@@ -89,6 +90,7 @@ const REVIEW_SCHEMA = {
     summary: { type: 'string' },
     discrepancies: { type: 'string' },
     worktreeRemoved: { type: 'boolean' },
+    residualCommit: { type: 'string' },
     hitl: {
       type: 'object',
       properties: { triggered: { type: 'boolean' }, reason: { type: 'string' } },
@@ -164,6 +166,10 @@ async function pool(items, limit, run) {
 const done = []
 const hitl = []
 const failed = []
+// Every worktree the fleet creates is registered here the moment its claim succeeds, so the final
+// Sweep can reconcile reality against intent. Cleanup delegated to the reviewer alone is cleanup that
+// silently doesn't happen when the reviewer dies — which is exactly what the first real run hit.
+const worktrees = []
 let round = 0
 const MAX_ROUNDS = 20
 
@@ -221,6 +227,7 @@ while (round < MAX_ROUNDS) {
     if (PROTECTED_BRANCHES.includes(claim.branch)) {
       throw new Error(`claim for #${task.number} returned protected branch "${claim.branch}" — refusing to implement on it`)
     }
+    worktrees.push({ number: task.number, path: claim.worktreePath, branch: claim.branch, baseSha: claim.baseSha })
 
     const impl = await tryAgent(
       `In the worktree at ${claim.worktreePath} (branch ${claim.branch}), invoke /implement for ` +
@@ -265,13 +272,24 @@ while (round < MAX_ROUNDS) {
         `the final commit SHA, and a short summary, then leave it open and assigned — that is the ` +
         `"awaiting human merge" state.\n` +
         `- If a fix would need an irreversible or high-blast-radius action, or a conflict you cannot resolve ` +
-        `after a genuine attempt, STOP: change nothing further, report hitl.triggered=true with why, and leave ` +
-        `the worktree in place for a human.\n` +
-        `Otherwise: squash to one tidy commit on ${impl.branch}, verify git status --porcelain is empty in the ` +
-        `worktree, then dispose of it — git worktree remove ${impl.worktreePath} && git worktree prune. Never ` +
-        `pass --force: the refusal means uncommitted work is still there and is the safety check, not an ` +
-        `obstacle. Keep the branch; only the worktree goes. Return committed=true with the branch, final SHA, ` +
-        `and whether the worktree was removed.\n\nHandoff:\n${impl.handoff}`,
+        `after a genuine attempt, STOP fixing and report hitl.triggered=true with why. Stopping does not exempt ` +
+        `you from the exit state below — you still commit what exists and still dispose of the worktree. The ` +
+        `branch preserves everything a human needs; a stranded checkout does not.\n\n` +
+        `EXIT STATE — when you are done, the branch is the ONLY artifact left. No exceptions, including HITL:\n` +
+        `1. Squash your reviewed work into one tidy commit on ${impl.branch}.\n` +
+        `2. Leave NOTHING uncommitted. Run git status --porcelain in the worktree; if anything remains — ` +
+        `including untracked files — commit it onto ${impl.branch} as a separate, clearly-marked commit ` +
+        `("chore(wip): unreviewed residue from #${task.number}") rather than discarding it, and set ` +
+        `residualCommit to that SHA so the report can flag it as unreviewed. Never lose work to make the ` +
+        `worktree look clean.\n` +
+        `3. Dispose of the worktree: git worktree remove ${impl.worktreePath} && git worktree prune. Run this ` +
+        `from the primary checkout, not from inside the worktree. Never pass --force — a refusal means step 2 ` +
+        `is incomplete, so go back and commit what is left, then remove again. Force would delete the very work ` +
+        `step 2 exists to preserve.\n` +
+        `4. Confirm: git worktree list must no longer show ${impl.worktreePath}, and ${impl.branch} must still ` +
+        `exist with your commit on it. Report worktreeRemoved accordingly — report it honestly as false if ` +
+        `removal genuinely failed, so the Sweep phase can finish the job.\n\n` +
+        `Handoff:\n${impl.handoff}`,
       { phase: 'Review & Fix', schema: REVIEW_SCHEMA, label: `review:${task.number}`, model: 'opus' }
     )
 
@@ -301,6 +319,7 @@ while (round < MAX_ROUNDS) {
         commitSha: review.commitSha,
         summary: review.summary,
         discrepancies: review.discrepancies,
+        residualCommit: review.residualCommit,
         worktreeRemoved: review.worktreeRemoved !== false,
       })
     }
@@ -312,10 +331,60 @@ while (round < MAX_ROUNDS) {
 
 if (round === MAX_ROUNDS) log(`Hit the ${MAX_ROUNDS}-round safety cap — some issues may remain unprocessed.`)
 
-const leftBehind = done.filter((d) => !d.worktreeRemoved).map((d) => `#${d.number}`)
-if (leftBehind.length) log(`Worktrees not confirmed removed for ${leftBehind.join(', ')} — sweep manually.`)
+// The fleet's exit invariant is "branches, no worktrees". The reviewers are asked to hold it, but an
+// agent that dies mid-review never runs its cleanup — so verify it here rather than trusting it, and
+// repair what's broken. This phase always runs, even when every lane failed.
+phase('Sweep')
+const sweep = worktrees.length
+  ? await tryAgent(
+      `Final cleanup for the fleet. These worktrees were created during this run:\n` +
+        worktrees.map((w) => `- #${w.number}: ${w.path} on branch ${w.branch} (based on ${w.baseSha})`).join('\n') +
+        `\n\nRun git worktree list from the primary checkout and reconcile. For each one that STILL EXISTS:\n` +
+        `1. Inspect it: git -C <path> status --porcelain and git -C <path> log --oneline <base>..HEAD.\n` +
+        `2. If anything is uncommitted or untracked, commit it onto that worktree's own branch as ` +
+        `"chore(wip): unrecovered work from #<n>". Losing work is never an acceptable way to clean up, and ` +
+        `the branch is where it belongs.\n` +
+        `3. Remove the worktree: git worktree remove <path>. Never pass --force — if it refuses, step 2 is ` +
+        `incomplete; go finish it and retry. Only if a path is already gone from disk but still listed should ` +
+        `you use git worktree prune.\n` +
+        `4. Never delete a branch, never merge, never push, never touch trunk or the primary checkout's ` +
+        `working tree.\n\n` +
+        `Finish with git worktree list and report exactly what remains. remainingPaths must list any worktree ` +
+        `you could not dispose of, with the reason — report honestly rather than claiming a clean sweep.`,
+      {
+        schema: {
+          type: 'object',
+          properties: {
+            swept: { type: 'array', items: { type: 'string' } },
+            recoveredCommits: { type: 'array', items: { type: 'string' } },
+            remainingPaths: { type: 'array', items: { type: 'string' } },
+            notes: { type: 'string' },
+          },
+          required: ['swept', 'remainingPaths'],
+        },
+        label: 'sweep:worktrees',
+      }
+    )
+  : { swept: [], remainingPaths: [], notes: 'no worktrees were created' }
 
-return { done, hitl, failed, roundsUsed: round, lanes: LANES }
+const remaining = sweep?.remainingPaths ?? worktrees.map((w) => w.path)
+if (!sweep) {
+  log('Sweep agent died — worktrees may still be live. Run `git worktree list` and clean up by hand.')
+} else if (remaining.length) {
+  log(`Sweep could not dispose of ${remaining.length} worktree(s): ${remaining.join(', ')}`)
+} else {
+  log(`Sweep clean — ${worktrees.length} worktree(s) disposed, branches intact.`)
+}
+
+return {
+  done,
+  hitl,
+  failed,
+  roundsUsed: round,
+  lanes: LANES,
+  branches: worktrees.map((w) => ({ number: w.number, branch: w.branch })),
+  sweep: { swept: sweep?.swept ?? [], recovered: sweep?.recoveredCommits ?? [], remaining, notes: sweep?.notes },
+}
 ```
 
 ## Resuming after a partial failure
@@ -387,6 +456,21 @@ survive — recover, don't restart:
   because nothing has landed. Removing a worktree requires it to be clean, which is exactly the check
   that no work is being discarded — hence the explicit ban on `--force`, which would silently throw
   away a reviewer's uncommitted fix.
+- **"Branches, no worktrees" is an invariant, not an instruction.** Every exit path commits to the
+  branch and disposes of the checkout — including HITL, where earlier versions of this template left
+  the worktree "in place for a human". That was the wrong trade: a branch carries everything a human
+  needs to resume, a stranded checkout carries the same content plus a cleanup chore, and the first
+  real run ended with four live worktrees and one holding uncommitted review fixes. The two halves
+  are what make it safe to always dispose: **nothing is discarded** (leftovers become a marked
+  `chore(wip)` commit on the branch, surfaced in the report as unreviewed) and **nothing is forced**
+  (a `remove` refusal means the commit step is incomplete, so the fix is to finish committing, never
+  to force past it).
+- **The Sweep phase verifies rather than trusts.** Cleanup delegated to the reviewer is cleanup that
+  doesn't happen when the reviewer dies — precisely the observed failure. So every claim registers its
+  worktree in `worktrees`, and a final deterministic phase reconciles that list against
+  `git worktree list`, recovering any uncommitted work onto its branch before disposing. It runs even
+  when every lane failed, since that's exactly when the most is left behind. It is also the one stage
+  that must never delete a branch: the branches are the deliverable.
 - **Every external input fails loud.** `args` is validated before a single agent spawns; the label's
   existence is confirmed before Discover returns anything; the claim stage refuses a protected branch
   and refuses to reuse an existing worktree. This is not defensive boilerplate — the sibling skill's
