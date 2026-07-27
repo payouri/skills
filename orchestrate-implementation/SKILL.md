@@ -62,6 +62,16 @@ conventions rather than copying it verbatim.
   or a rebase/merge conflict the reviewer can't resolve after a genuine attempt. Leave the issue open,
   record why, keep going with the rest of the fleet.
 - **Claim by assignee, close by comment-then-close**, per the tracker convention resolved in step 1.
+- **A dead agent degrades one sub-task, never the fleet.** `agent()` returns `null` rather than throwing
+  when a subagent dies, and a provider-side overload kills every in-flight agent at once. Null-check
+  every stage, let nothing outside `pipeline()` dereference an unchecked value, and back off with
+  escalating waits (honoring any `Retry-After` the provider gave) instead of re-spawning straight back
+  into the same overload. REFERENCE.md's `tryAgent` wrapper is not optional.
+
+If the run dies partway, **recover rather than restart**: read `journal.jsonl` for what actually
+completed, inspect each worktree for uncommitted work a killed reviewer left, then
+`Workflow({ scriptPath, resumeFromRunId })` so completed stages replay from cache. Keep surviving
+prompts byte-identical or they re-run live. Full procedure in [REFERENCE.md](REFERENCE.md).
 
 ## 4. Final report
 

@@ -7,7 +7,8 @@ control flow (discover → pipeline → loop → discrepancy check) stays the sa
 
 Pass `args: { epic: <number>, repo: "<owner>/<repo>", featureBranch: "feature/epic-<number>" }` on
 the `Workflow` call. Create `featureBranch` off `trunk` yourself (a local branch, no push) before
-invoking, if it doesn't already exist.
+invoking, if it doesn't already exist. Add `retryAfterMs: <ms>` when a previous run surfaced a
+`Retry-After` header — it becomes the backoff floor.
 
 > **Known issue — `args` may arrive JSON-stringified.** Observed repeatedly across separate projects
 > and invocations (with and without `resumeFromRunId`): the object passed as `args` reaches the script
@@ -112,7 +113,7 @@ try {
     `orchestrate-implementation got an args string it could not parse: ${String(args).slice(0, 200)}`
   )
 }
-const { epic, repo, featureBranch } = input ?? {}
+const { epic, repo, featureBranch, retryAfterMs } = input ?? {}
 const PROTECTED_BRANCHES = ['trunk', 'main', 'master']
 if (!epic || !repo || !featureBranch) {
   throw new Error(
@@ -127,15 +128,40 @@ if (PROTECTED_BRANCHES.includes(featureBranch)) {
   )
 }
 
+// `agent()` returns null — it does NOT throw — when a subagent dies on a terminal API error after its
+// own internal retries. A provider-side 529 overload takes out every in-flight agent at once, so this
+// is a fleet-wide event, not a per-task fluke: re-spawning immediately just hands the overloaded server
+// more of the same load. Back off, escalating, and give it room.
+//
+// The script cannot see the HTTP response, so a `Retry-After` header is invisible here. When the
+// orchestrator DID observe one (in a failed run's error output), it passes the value as
+// `retryAfterMs` and that becomes the floor. Otherwise the floor is a conservative 60s.
+// Re-spawn with a byte-identical prompt/opts so a later `resumeFromRunId` still matches the cache.
+const pause = typeof setTimeout === 'function' ? (ms) => new Promise((r) => setTimeout(r, ms)) : async () => {}
+const BACKOFF_FLOOR_MS = Math.max(30_000, retryAfterMs || 60_000)
+async function tryAgent(prompt, opts, attempts = 3) {
+  for (let i = 1; i <= attempts; i++) {
+    const result = await agent(prompt, opts)
+    if (result) return result
+    if (i === attempts) break
+    const waitMs = BACKOFF_FLOOR_MS * 2 ** (i - 1)
+    log(`${opts.label}: agent returned null (attempt ${i}/${attempts}) — backing off ${Math.round(waitMs / 1000)}s`)
+    await pause(waitMs)
+  }
+  log(`${opts.label}: agent dead after ${attempts} attempts`)
+  return null
+}
+
 const landed = []
 const hitl = []
+const failed = []
 let round = 0
 const MAX_ROUNDS = 20
 
 while (round < MAX_ROUNDS) {
   round++
   phase('Discover')
-  const discovery = await agent(
+  const discovery = await tryAgent(
     `Repo ${repo}. First confirm epic #${epic} exists and is open (gh issue view ${epic}). If it ` +
       `does not exist, or you cannot confirm it, set epicFound=false and return an empty subtasks array — do ` +
       `NOT substitute a similar-looking issue from a different epic. If confirmed, read ` +
@@ -152,6 +178,11 @@ while (round < MAX_ROUNDS) {
     { schema: DISCOVERY_SCHEMA, label: `discover:round-${round}` }
   )
 
+  if (!discovery) {
+    log(`Round ${round}: discovery agent died even after retries — stopping the loop, keeping what already landed.`)
+    break
+  }
+
   if (!discovery.epicFound) {
     throw new Error(`Discover could not confirm epic #${epic} exists in ${repo} — stopping before claiming anything.`)
   }
@@ -164,7 +195,7 @@ while (round < MAX_ROUNDS) {
   const results = await pipeline(
     discovery.subtasks,
     (task) =>
-      agent(
+      tryAgent(
         `Claim GitHub issue #${task.number} in ${repo}: gh issue edit ${task.number} --add-assignee @me. ` +
           `Then confirm branch "${featureBranch}" actually exists locally (git rev-parse --verify ` +
           `${featureBranch}). If it does not exist, set ok=false with a reason and stop there — do NOT ` +
@@ -174,10 +205,16 @@ while (round < MAX_ROUNDS) {
         { phase: 'Claim', schema: CLAIM_SCHEMA, label: `claim:${task.number}` }
       ),
     (claim, task) => {
+      // Null-check every stage: `agent()` returns null on a dead subagent, and `claim.ok` on a null
+      // would be a TypeError. A throw here is contained — pipeline() drops the item to null and skips
+      // its remaining stages — so this degrades one sub-task, not the fleet.
+      if (!claim) {
+        throw new Error(`claim agent for #${task.number} died after retries — nothing claimed, no worktree created`)
+      }
       if (!claim.ok) {
         throw new Error(`claim failed for #${task.number}: ${claim.reason ?? 'unknown reason'} — skipping implement/review`)
       }
-      return agent(
+      return tryAgent(
         `In the worktree at ${claim.worktreePath} (branch ${claim.branch}), invoke /implement for ` +
           `sub-task #${task.number}: ${task.title}\n\n${task.body}\n\n` +
           `Do NOT invoke /code-review yourself — a separate reviewer agent handles that. ` +
@@ -192,8 +229,14 @@ while (round < MAX_ROUNDS) {
         }
       )
     },
-    (impl, task) =>
-      agent(
+    (impl, task) => {
+      if (!impl) {
+        throw new Error(
+          `implement agent for #${task.number} died after retries — its worktree is left in place, possibly ` +
+            `dirty, and the issue stays assigned. Inspect it before rerunning.`
+        )
+      }
+      return tryAgent(
         `Reviewing sub-task #${task.number}. Use the SAME worktree the implementer used — do not create ` +
           `a new one: ${impl.worktreePath}, branch ${impl.branch}. You did not write this code; read the ` +
           `handoff below, then run /code-review against ${featureBranch}. Fix any findings yourself — ` +
@@ -209,10 +252,20 @@ while (round < MAX_ROUNDS) {
           `worktree remove ${impl.worktreePath} --force). Never push or open a PR.\n\nHandoff:\n${impl.handoff}`,
         { phase: 'Review & Fix', schema: REVIEW_SCHEMA, label: `review:${task.number}`, model: 'opus' }
       )
+    }
   )
 
-  results.filter(Boolean).forEach((r, i) => {
+  // Index into `discovery.subtasks` with the UNFILTERED index — `pipeline()` returns one slot per
+  // input item, nulling the dropped ones. Filtering first would shift every later result onto the
+  // wrong sub-task and report commits against issue numbers that never produced them. Nothing in
+  // here may dereference an unchecked value: this handler runs outside `pipeline()`'s per-item error
+  // containment, so a TypeError aborts the entire run — including sub-tasks already merged.
+  results.forEach((r, i) => {
     const task = discovery.subtasks[i]
+    if (!r) {
+      failed.push({ number: task.number, title: task.title, reason: 'a stage threw or its agent died — see the log' })
+      return
+    }
     if (r.landed) landed.push({ number: task.number, title: task.title, summary: r.summary, commitSha: r.commitSha })
     if (r.hitl?.triggered) hitl.push({ number: task.number, title: task.title, reason: r.hitl.reason })
   })
@@ -221,16 +274,48 @@ while (round < MAX_ROUNDS) {
 if (round === MAX_ROUNDS) log(`Hit the ${MAX_ROUNDS}-round safety cap — some sub-tasks may remain undiscovered.`)
 
 phase('Discrepancy check')
-const discrepancies = await agent(
+const discrepancies = await tryAgent(
   `Compare epic #${epic}'s spec (title, body, acceptance criteria) in ${repo} against what ` +
     `actually landed on ${featureBranch} (git log/diff against its merge-base with trunk, plus the ` +
     `closed sub-issues and their summary comments). Report anything specified but not delivered, delivered ` +
     `but not specified, or diverging from the spec's intent.`,
-  { schema: { type: 'object', properties: { discrepancies: { type: 'string' } }, required: ['discrepancies'] } }
+  {
+    schema: { type: 'object', properties: { discrepancies: { type: 'string' } }, required: ['discrepancies'] },
+    label: 'discrepancy-check',
+  }
 )
 
-return { landed, hitl, discrepancies: discrepancies.discrepancies, roundsUsed: round }
+// This is the last call in the run, so a bare `discrepancies.discrepancies` would throw away the
+// entire report over one dead agent — after every sub-task had already merged. Degrade instead.
+return {
+  landed,
+  hitl,
+  failed,
+  discrepancies: discrepancies?.discrepancies ?? 'UNKNOWN — the discrepancy-check agent died; re-run it manually.',
+  roundsUsed: round,
+}
 ```
+
+## Resuming after a partial failure
+
+A fleet-wide API failure kills every in-flight agent at once, so the usual shape of a bad run is
+"all implementations committed, all reviews dead." Those commits are durable and survive on their
+sub-task branches — recover, don't restart:
+
+1. **Read `journal.jsonl` in the run's transcript dir first.** It records each agent's actual return
+   value, so it tells you which stages really completed. Don't infer it from the error, and don't
+   assume a cached result is non-empty.
+2. **Check every worktree's state** — `git -C <wt> status --porcelain` and `git -C <wt> log --oneline -1`.
+   A reviewer killed mid-fix leaves uncommitted changes; that partial work must be re-reviewed against
+   the base, never committed on trust.
+3. **Edit the persisted script, then resume**: `Workflow({ scriptPath, resumeFromRunId })`. The longest
+   unchanged prefix of `agent()` calls replays from cache, so successful implementations cost nothing.
+4. **Keep surviving prompts byte-identical.** The cache keys on `(prompt, opts)` in call order —
+   reword a prompt and that call plus everything after it re-runs live. Wrapping `agent()` is safe;
+   changing the string it receives is not.
+5. **If the failure was rate/overload-driven, pass `retryAfterMs`** from whatever the provider asked
+   for, and consider fewer sub-tasks per round — several Opus reviewers starting within seconds of
+   each other is itself part of the load.
 
 ## Notes on the design choices baked into this template
 
@@ -269,6 +354,26 @@ return { landed, hitl, discrepancies: discrepancies.discrepancies, roundsUsed: r
   same broken input, correctly refused trunk but landed on an orphaned branch instead. A missing or
   malformed `args` field, or a merge target that isn't verifiably the real `featureBranch`, must stop
   the fleet (or that one sub-task) outright — it must never be treated as "good enough, proceed."
+- **A dead agent must degrade one sub-task, never the fleet.** `agent()` returns `null` rather than
+  throwing when a subagent dies on a terminal API error, and a provider-side **529 overload kills every
+  in-flight agent simultaneously** — observed on the sibling skill's first real run, where four
+  implementations were already committed and all four Opus reviewers died at once. Inside `pipeline()` a
+  throw is contained (the item drops to `null` and skips its remaining stages), which is why each stage
+  null-checks its input and throws a descriptive error. What is *not* contained is anything after the
+  pipeline: on that run a null review reached `review.committed` in the result handler and the resulting
+  `TypeError` aborted a workflow whose work was sitting safely on disk. So: null-check every stage, and
+  let nothing outside `pipeline()` — result handler or final discrepancy read — dereference an unchecked
+  value.
+- **Back off; don't hammer.** `tryAgent` re-spawns a dead call up to three times with escalating waits
+  from a 60s floor. A 529 means the provider is overloaded, so an immediate retry adds to the very load
+  that caused the failure — and since the whole fleet dies together, every lane would retry in lockstep.
+  The script can't read a `Retry-After` header (it never sees the HTTP response), so when the
+  orchestrator observed one it passes `retryAfterMs` and that becomes the floor. Retries reuse a
+  byte-identical prompt so `resumeFromRunId` still matches the cache.
+- **Index results with the unfiltered index.** `pipeline()` returns one slot per input item, nulling
+  the dropped ones, so `results.filter(Boolean).forEach((r, i) => discovery.subtasks[i])` shifts every
+  result after the first failure onto the wrong sub-task — reporting commits and HITL reasons against
+  issue numbers that never produced them. Filter *after* pairing, never before indexing.
 - **Read `args` through the normalizer, never directly.** The script destructures `epic`/`repo`/
   `featureBranch` once at the top and interpolates those bindings; `args` itself is referenced only
   in the error message. `args` is the sole `Workflow` input with no declared type in its schema, so
