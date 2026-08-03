@@ -19,7 +19,7 @@ The run is **three acts, orchestrator in the loop between each**:
 | ---------------- | ---------------------------------------------------------------------- | -------------------------- |
 | **1. Build**     | Workflow A — discover → claim → implement → integrate, looped           | nobody                     |
 | **2. Attack**    | `/adversarial-code-review` over the whole feature branch, all five lenses | 5 attackers + 5 refuters |
-| **3. Repair**    | Workflow B — tiered fixers for every non-refuted finding, then discrepancy check | nobody           |
+| **3. Repair**    | Workflow B — tiered fixers for every non-refuted finding, discrepancy check, then the epic comment | nobody |
 
 Review is **branch-wide and once**, not per-sub-task. An implementer implements and stops; nothing
 reviews its diff in isolation. That is deliberate — a defect that exists only because sub-task #12
@@ -81,19 +81,42 @@ Don't re-implement its attack/refute logic. Run its script, hold its per-lens ve
 
 ## 3. Act 3 — repair
 
-Run Workflow B from [REFERENCE.md](REFERENCE.md) § Workflow B, passing every finding whose verdict is
-`CONFIRMED` or `PLAUSIBLE`. It:
+Run Workflow B from [REFERENCE.md](REFERENCE.md) § Workflow B, passing **every** finding act 2
+produced — `REFUTED` and `UNJUDGED` included, since the script both filters for what to fix and
+tallies the rest — plus **act 1's return value** as `build`. It:
 
 1. **Triages each finding's _fix_ complexity** — not the defect's severity. A blocker fixed by
    flipping a comparison is `trivial`/Haiku; a minor smell whose fix reshapes an interface is
    `intricate`/Opus.
 2. Groups findings by file so two fixers never contend for the same lines, fixes each group in its
    own worktree off the feature branch, then lands them through the same serial-integrator discipline.
-3. Ends with the **discrepancy check** — epic spec vs. what actually landed.
+3. Runs the **discrepancy check** — epic spec vs. what actually landed, measured against `baseSha`.
+4. **Comments the merge-readiness report on the epic** — unconditionally, and it does not close it.
 
 `REFUTED` findings are never fixed. `UNJUDGED` findings (the refuter died before verdicting them) are
 **reported, never auto-fixed** — nothing has vetted them, so a fixer would be acting on an unchecked
 claim.
+
+### The epic comment
+
+Everything a run produces — sub-tasks landed, five lenses of review, fixes, discrepancies — otherwise
+exists only in the orchestrator's terminal, while the epic shows children silently closing one by one.
+The comment is the durable record, addressed to whoever decides whether the branch is mergeable:
+
+- **Composed in the script, not by the agent.** The body is built from the run's actual values; the
+  posting agent is told to post it verbatim and may not summarize, reorder, or soften it. A summarizer
+  handed raw results is free to round "one confirmed blocker unfixed" down to "minor issues remain".
+- **Leads with what blocks a merge**: every non-refuted finding no fix landed for (severity orders the
+  list, it doesn't gate membership — a survived `major` matters to the merger too), every `UNJUDGED`
+  claim, every sub-task or fix that escalated or died, and where that work is still sitting.
+- **Posted even on a clean run.** Silence can't distinguish "nothing outstanding" from "the fleet
+  never got there", so a clean run says so explicitly.
+- **Never closes the epic, never touches labels.** The epic closes when a human merges the branch,
+  which this skill never does.
+
+Act 1's integrator does the same at sub-task level: when a sub-task fails to land it comments why and
+names the branch and worktree holding its work, rather than leaving an issue open and assigned, which
+reads as in-progress and gets skipped by later rounds on the assignee alone.
 
 ## 4. Hard rules every act must enforce
 
@@ -114,7 +137,10 @@ claim.
 - **Never push, open a PR, or merge the feature branch into the base branch** — that's a separate,
   explicitly human-confirmed step.
 - **HITL escalation, not a forced merge**, on a security/destructive-action concern or any conflict.
-  Leave the issue open, record why, keep going with the rest of the fleet.
+  Leave the issue open, **comment why**, keep going with the rest of the fleet. An escalation nobody
+  wrote down is indistinguishable from work still in flight.
+- **The run leaves a trace on the tracker, not just in the terminal.** The epic gets the
+  merge-readiness comment; a stalled sub-task gets the reason it stalled. Neither gets closed.
 - **Claim by assignee, close by comment-then-close** at land time, per the tracker convention from
   step 0. Findings that later touch a closed sub-task become fix commits, not reopened issues.
 - **A dead agent degrades one unit of work, never the fleet.** `agent()` returns `null` rather than
@@ -139,3 +165,6 @@ Once act 3 returns, give the user exactly five sections:
 - **Not fixed** — `UNJUDGED` findings, plus any fix that failed or escalated. These are the user's.
 - **Discrepancies** — epic spec vs. what was delivered.
 - **HITL escalations** — every unit of work that stopped short of landing and why, or "none".
+
+Close with the epic comment's URL. If `epicComment.posted` is false, say so and paste
+`epicComment.body` — the record has to land somewhere, and the terminal is the fallback, not the plan.

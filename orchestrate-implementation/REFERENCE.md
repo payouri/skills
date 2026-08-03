@@ -317,9 +317,13 @@ while (round < MAX_ROUNDS) {
       `looks wrong, STOP the whole round and report hitl.triggered=true on every remaining sub-task.\n` +
       `2. Rebase the sub-task branch onto ${featureBranch}, squashed to one tidy commit.\n` +
       `3. If the rebase conflicts AT ALL: git rebase --abort, leave the branch and worktree in place, ` +
-      `leave the issue open and assigned, set landed=false and hitl.triggered=true with the conflicting ` +
+      `leave the issue OPEN and assigned, set landed=false and hitl.triggered=true with the conflicting ` +
       `paths as the reason, and move on to the next sub-task. Do NOT resolve the conflict — a guessed ` +
-      `resolution corrupts the branch silently. Do NOT skip ahead to a later branch to "unblock" it.\n` +
+      `resolution corrupts the branch silently. Do NOT skip ahead to a later branch to "unblock" it. ` +
+      `Before moving on, comment on the issue saying it did not land, naming the branch and worktree its ` +
+      `work is sitting in and the conflicting paths — an issue left silently open and assigned reads as ` +
+      `in-progress rather than stalled, and a later round will skip it on the assignee without anyone ` +
+      `knowing why.\n` +
       `4. On a clean rebase: git -C ${repoPath} merge --ff-only <branch>. Then comment on issue ` +
       `#<number> with the commit link and the summary above, close it, and remove the worktree ` +
       `(git worktree remove <path> --force). Set landed=true with the resulting SHA.\n\n` +
@@ -377,7 +381,7 @@ Keep its full output. Workflow B consumes the `CONFIRMED`/`PLAUSIBLE` findings; 
 
 ## Workflow B — repair
 
-`args` is the shared preamble's object plus `findings`, each shaped as the review returned it:
+`args` is the shared preamble's object plus `findings` and `build`:
 
 ```json
 {
@@ -394,9 +398,21 @@ Keep its full output. Workflow B consumes the `CONFIRMED`/`PLAUSIBLE` findings; 
       "verdict": "CONFIRMED",
       "verdictReason": "…"
     }
-  ]
+  ],
+  "build": { "landed": [], "hitl": [], "failed": [], "roundsUsed": 2 }
 }
 ```
+
+**Pass every finding act 2 produced — `REFUTED` and `UNJUDGED` included, not just the repairable
+ones.** The script filters for what to fix; it needs the rest to compute the per-lens tally the epic
+comment reports. A tally that omits the refuted claims reads as though the review found less than it
+did, which is the opposite of what the audit trail is for.
+
+**`build` is Workflow A's return value, verbatim.** Act 3 writes the merge-readiness comment on the
+epic, and a merger's blockers include act 1's — a sub-task that never landed because its rebase
+conflicted matters more to them than a minor smell act 3 already fixed. The orchestrator is the only
+thing holding both halves, so it hands act 1's result to act 3 rather than each act reporting its own
+fragment. Pass `{}` if act 1 was skipped.
 
 ```js
 export const meta = {
@@ -407,6 +423,7 @@ export const meta = {
     { title: 'Fix' },
     { title: 'Integrate fixes' },
     { title: 'Discrepancy check' },
+    { title: 'Report to epic' },
   ],
 }
 
@@ -484,7 +501,7 @@ try {
 } catch {
   throw new Error(`orchestrate-implementation repair got an args string it could not parse: ${String(args).slice(0, 200)}`)
 }
-const { epic, repo, repoPath, featureBranch, baseBranch, baseSha, findings, retryAfterMs } = input ?? {}
+const { epic, repo, repoPath, featureBranch, baseBranch, baseSha, findings, build, retryAfterMs } = input ?? {}
 const PROTECTED_BRANCHES = ['trunk', 'main', 'master', baseBranch].filter(Boolean)
 if (!epic || !repo || !repoPath || !featureBranch || !baseSha || !Array.isArray(findings)) {
   throw new Error(
@@ -669,15 +686,140 @@ const discrepancies = await tryAgent(
   }
 )
 
-// Last call in the run: a bare `discrepancies.discrepancies` would throw away the entire report over
-// one dead agent, after every fix had already merged. Degrade instead.
+// A dead discrepancy agent must not take the report down with it — every fix has already merged by
+// now, and the epic comment below is the only durable record of this run.
+const discrepancyText =
+  discrepancies?.discrepancies ?? 'UNKNOWN — the discrepancy-check agent died; re-run it manually.'
+
+// ---- Merge-readiness comment on the epic -------------------------------------------------------
+// Composed HERE, in code, from values the run actually produced. The agent posts it; it does not
+// author it. A summarizer handed the raw results would be free to round "3 findings unfixed" down to
+// "minor issues remain" — and this comment is what someone reads instead of re-deriving the state of
+// a branch they did not build.
+phase('Report to epic')
+
+const buildLanded = build?.landed ?? []
+const buildHitl = build?.hitl ?? []
+const buildFailed = build?.failed ?? []
+
+const tally = {}
+for (const f of findings) {
+  const lens = f?.lens ?? 'unknown'
+  tally[lens] ??= { CONFIRMED: 0, PLAUSIBLE: 0, REFUTED: 0, UNJUDGED: 0 }
+  if (tally[lens][f?.verdict] !== undefined) tally[lens][f.verdict]++
+}
+const tallyLine =
+  Object.entries(tally)
+    .map(([lens, t]) => `${lens} ${t.CONFIRMED}C / ${t.PLAUSIBLE}P / ${t.REFUTED}R${t.UNJUDGED ? ` / ${t.UNJUDGED}U` : ''}`)
+    .join(' · ') || 'no findings'
+
+// "Unresolved" is every repairable finding whose id no landed fix commit claims — skipped by the
+// fixer, dropped with its group's agent, or lost at integration. Deriving it from what actually
+// landed (rather than trusting each fixer's self-report) is what keeps a failed integration from
+// being reported as a fix.
+const fixedIds = new Set(fixed.flatMap((f) => f.ids ?? []))
+const SEVERITY_ORDER = { blocker: 0, major: 1, minor: 2 }
+const unresolved = repairable
+  .filter((f) => !fixedIds.has(f.id))
+  .sort((a, b) => (SEVERITY_ORDER[a.severity] ?? 3) - (SEVERITY_ORDER[b.severity] ?? 3))
+
+const md = []
+md.push(`## Agent run — \`${featureBranch}\``)
+md.push(
+  `Branch is **local and unpushed**; nothing has been merged into \`${baseBranch ?? 'the base branch'}\`. ` +
+    `Everything below is measured against the pinned base \`${baseSha}\`.`
+)
+
+const needsAttention =
+  unresolved.length + unjudged.length + buildHitl.length + hitl.length + buildFailed.length + failedFixes.length
+md.push(
+  needsAttention
+    ? `### ⚠️ Before you merge — ${needsAttention} item(s)`
+    : `### ✅ Nothing outstanding from the fleet`
+)
+// EVERY unresolved finding, not just the blockers — a survived major that no fix landed is exactly
+// what a merger needs and exactly what a blockers-only list drops on the floor. Severity orders the
+// list; it does not gate membership.
+if (unresolved.length) {
+  md.push(`**Non-refuted findings still unfixed:**`)
+  md.push(unresolved.map((f) => `- **${f.severity}** \`${f.location}\` [${f.lens}/${f.verdict}] ${f.claim}`).join('\n'))
+}
+if (unjudged.length) {
+  md.push(`**Findings no refuter ever judged** — unvetted, deliberately not auto-fixed:`)
+  md.push(unjudged.map((f) => `- \`${f.location}\` [${f.lens}] ${f.claim}`).join('\n'))
+}
+if (buildHitl.length) {
+  md.push(`**Sub-tasks that did not land** (left open and assigned):`)
+  md.push(buildHitl.map((h) => `- #${h.number} ${h.title} — ${h.reason}`).join('\n'))
+}
+if (buildFailed.length) {
+  md.push(`**Sub-tasks whose agent died** (work may survive on their branches):`)
+  md.push(buildFailed.map((h) => `- #${h.number} ${h.title} — ${h.reason}`).join('\n'))
+}
+if (hitl.length || failedFixes.length) {
+  md.push(`**Fixes that did not land:**`)
+  md.push([...hitl, ...failedFixes].map((h) => `- \`${h.file}\` — ${h.reason}`).join('\n'))
+}
+
+md.push(`### Landed`)
+md.push(
+  buildLanded.length
+    ? buildLanded.map((l) => `- #${l.number} ${l.title} — \`${l.commitSha ?? '?'}\` (${l.model ?? '?'})`).join('\n')
+    : '_nothing_'
+)
+
+md.push(`### Review — ${tallyLine}`)
+md.push(
+  `All five lenses attacked \`${baseSha}...HEAD\`, then a fresh refuter per lens tried to kill every ` +
+    `claim. Only non-refuted findings were fixed. ` +
+    (fixed.length
+      ? `Fixed and landed: ${fixed.map((f) => `\`${f.file}\` (${(f.ids ?? []).join(', ')})`).join(', ')}.`
+      : `No fixes landed.`)
+)
+if (skipped.length) {
+  md.push(`Deliberately skipped by the fixer:`)
+  md.push(skipped.map((s) => `- \`${s.file}\` ${s.id} — ${s.reason}`).join('\n'))
+}
+
+md.push(`### Spec coverage`)
+md.push(discrepancyText)
+md.push(`<sub>Posted by orchestrate-implementation. The epic stays open — merging is a human step.</sub>`)
+
+const body = md.join('\n\n')
+
+const reported = await tryAgent(
+  `Post this comment verbatim on issue #${epic} in ${repo}, using a heredoc or a file so the markdown ` +
+    `survives intact: gh issue comment ${epic} --repo ${repo} --body-file <file>.\n\n` +
+    `Post it EXACTLY as written. Do not summarize it, do not soften it, do not reorder it, do not add ` +
+    `or drop items — it was composed from what the run actually produced, and every number in it is ` +
+    `load-bearing for whoever decides whether this branch is mergeable. You may not close the epic, ` +
+    `change its labels, or comment anywhere else.\n\n` +
+    `--- BEGIN COMMENT ---\n${body}\n--- END COMMENT ---`,
+  {
+    schema: {
+      type: 'object',
+      properties: { posted: { type: 'boolean' }, commentUrl: { type: 'string' }, reason: { type: 'string' } },
+      required: ['posted'],
+    },
+    label: `report:epic-${epic}`,
+    model: 'haiku',
+  }
+)
+
+if (!reported?.posted) {
+  log(`Could not comment on epic #${epic} — the report body is returned in epicComment for manual posting.`)
+}
+
 return {
   fixed,
   skipped,
   unjudged: unjudged.map((f) => ({ id: f.id, lens: f.lens, claim: f.claim, location: f.location })),
+  unresolved: unresolved.map((f) => ({ id: f.id, lens: f.lens, claim: f.claim, location: f.location, severity: f.severity })),
   hitl,
   failed: failedFixes,
-  discrepancies: discrepancies?.discrepancies ?? 'UNKNOWN — the discrepancy-check agent died; re-run it manually.',
+  tally,
+  discrepancies: discrepancyText,
+  epicComment: { posted: Boolean(reported?.posted), url: reported?.commentUrl, reason: reported?.reason, body },
 }
 ```
 
@@ -759,6 +901,20 @@ alone with the same `findings` — act 1's work is already on the branch.
   call also excludes already-*assigned* issues, which is what keeps a sub-task claimed in an earlier,
   still-in-flight round from being re-claimed by a later round's pipeline — assignment doubles as the
   concurrency guard, dependency status doubles as the ordering guard.
+- **The epic gets a comment; the script writes it, an agent only posts it.** An earlier draft never
+  wrote to the epic at all — it read the epic three times and wrote to it zero times, so a whole run
+  (sub-tasks landed, five lenses attacked, fixes applied, spec gaps found) existed only in the
+  orchestrator's terminal while the epic showed children silently closing. The comment closes that,
+  and two details in how it's built are load-bearing. First, the body is composed in JS from the run's
+  actual values and the agent is instructed to post it verbatim: a summarizer handed the raw results
+  would be free to render "one CONFIRMED blocker, no fix landed" as "minor issues remain", and this
+  comment is what someone reads *instead of* re-deriving the state of a branch they did not build.
+  Second, "unresolved" is derived from `fixed` — the ids that actually landed on the branch — not from
+  each fixer's self-reported success, so a fix lost at integration cannot be reported as applied.
+  It lists every unresolved non-refuted finding, not just the blockers: severity orders the list, it
+  does not gate membership, because a survived `major` nobody fixed is exactly what a merger needs and
+  exactly what a blockers-only list drops. It posts even on a clean run (silence can't distinguish
+  "clean" from "never got there") and it never closes the epic — that happens when a human merges.
 - **Issues close at land time, not after review.** A finding raised in act 2 becomes a fix commit on
   the feature branch, never a reopened sub-task: the sub-task's contract was "this change, on this
   branch", and it met it. Keeping issues open through a branch-wide review window would leave every
