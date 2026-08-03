@@ -43,6 +43,18 @@ PRD/spec under `docs/`, `specs/`, or `.scratch/` matching the branch or feature;
 Instruction: `The spec is <path, or the contents pasted>. Attack the gap between it and the diff.`
 No spec → Spec is unavailable; say so rather than inventing the requirements.
 
+**A diff spanning several issues has a composite spec.** If the fixed point covers more than one
+issue — an epic branch, a stack of sub-tasks, any range whose log cites several — the spec is the
+**union of all of them**, each block labelled with its issue number, and the parent's body alone is
+not enough. A parent states the goal; its children carry the acceptance criteria whoever wrote the
+code actually worked from, and a requirement is frequently written down *only* there. Handed the
+parent alone, the lens can only see gaps at parent altitude and will pass a branch where a child's
+third AC was quietly skipped. Two rules when assembling it: fetch each child's body from the tracker
+rather than reusing any implementation summary attached to it (a summary describes what was built, so
+it agrees with the code by construction — the divergence between issue and code is the finding), and
+if some children deliberately did not land, name their numbers and tell the lens to ignore their ACs
+rather than reporting them as gaps.
+
 **Vendored, not linked.** `maintainability.md` and `standards.md` are copies — of
 `thermonuclear-review/SKILL.md` and `code-review`'s Fowler smell baseline respectively, provenance in
 each file's header. Copying is what makes this skill standalone, and staleness is the price: when

@@ -73,11 +73,58 @@ Invoke `/adversarial-code-review` and follow its own SKILL.md §1–§4 against 
   from the primary checkout is the epic's whole contribution and nothing else.
 - **Lenses**: all five — Bugs, Maintainability, Security, Standards, Spec. Pass them explicitly so
   its §2 `AskUserQuestion` does not fire.
-- **Spec rulebook**: the epic issue's body and acceptance criteria, fetched. The Spec lens is never
+- **Spec rulebook**: a **composite spec** — the epic's body and acceptance criteria, *plus the body
+  and ACs of every sub-issue that landed*. Build it as described below. The Spec lens is never
   unavailable here — an epic always has a spec.
 
 Don't re-implement its attack/refute logic. Run its script, hold its per-lens verdicts, and carry the
 `REFUTED` ones through to the report's audit log.
+
+### Building the composite spec
+
+The epic is not the whole spec. An epic states the goal; its sub-issues carry the acceptance criteria
+the implementers actually worked from, and those ACs are frequently the only place a requirement is
+written down. A Spec lens handed the epic alone can only catch gaps visible at epic altitude, and will
+pass a branch where a sub-issue's third AC was quietly skipped.
+
+Assemble the bundle before invoking, per the tracker convention from step 0:
+
+1. Fetch the epic's body and acceptance criteria.
+2. Fetch **each landed sub-issue's body and ACs by number**, fresh from the tracker.
+3. Label each block with its issue number, and mark which ones landed.
+
+Two rules about what goes in:
+
+- **Fetch sub-issue bodies from the tracker, never reuse the implementers' summaries.** Act 1 returns
+  a `summary` per sub-task, but that is the implementer's account of what it built — grading code
+  against it asks the author to set its own exam, and every Spec finding worth having is precisely
+  where the two diverge.
+- **Scope to sub-issues that landed, and name the ones that didn't.** A sub-task that escalated to
+  HITL has unmet ACs *by design*; those are already tracked as escalations and re-reporting them as
+  Spec defects buries the real gaps in noise. List the non-landed issue numbers in the rulebook and
+  tell the lens to ignore their ACs.
+
+### Two spec checks, two altitudes
+
+The Spec lens and act 3's discrepancy check both compare code to intent, and it is tempting to give
+them the same input. Don't — the composite spec belongs to the lens only:
+
+|  | **Spec lens** (act 2) | **Discrepancy check** (act 3) |
+| --- | --- | --- |
+| Judges against | epic **+ every landed sub-issue's ACs** | the **epic's own criteria** |
+| Question | is each stated AC satisfied by code? | does this deliver what the epic asked for? |
+| Grain | line-level, anchored to `path:line` | whole-branch |
+| Catches | a sub-issue AC nobody implemented | a requirement **no sub-issue was ever filed for** |
+
+The second row is the whole point. A fleet can close every sub-issue perfectly and still fail the
+epic, because the decomposition dropped something on the floor before implementation began — and that
+gap is invisible to anyone reading sub-issue ACs, since it is missing from all of them. Making the
+discrepancy check composite too collapses it into a second, coarser copy of the Spec lens and loses
+the one class of failure only it can see.
+
+So the discrepancy check reads sub-issues as **evidence of what was attempted**, never as the
+standard. When an epic criterion is unmet only because a sub-task escalated, it says so in one line
+rather than re-litigating it — the merger already has that from the epic comment.
 
 ## 3. Act 3 — repair
 
@@ -90,7 +137,8 @@ tallies the rest — plus **act 1's return value** as `build`. It:
    `intricate`/Opus.
 2. Groups findings by file so two fixers never contend for the same lines, fixes each group in its
    own worktree off the feature branch, then lands them through the same serial-integrator discipline.
-3. Runs the **discrepancy check** — epic spec vs. what actually landed, measured against `baseSha`.
+3. Runs the **discrepancy check** — the epic's own criteria vs. what actually landed, measured against
+   `baseSha`. See the split below: this one judges against the **epic**, not the sub-issues.
 4. **Comments the merge-readiness report on the epic** — unconditionally, and it does not close it.
 
 `REFUTED` findings are never fixed. `UNJUDGED` findings (the refuter died before verdicting them) are

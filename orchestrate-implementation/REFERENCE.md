@@ -372,7 +372,36 @@ Not a script. Invoke `/adversarial-code-review` and follow its SKILL.md, with:
   where `featureBranch` is checked out. Its §1 check is `git rev-parse <baseSha>` and
   `git diff <baseSha>...HEAD --stat`;
 - **all five lenses** passed explicitly, so its lens-selection `AskUserQuestion` doesn't fire;
-- the **epic issue body** as the Spec lens's rulebook.
+- a **composite spec** as the Spec lens's rulebook — the epic *and* every landed sub-issue's ACs.
+
+The Spec rulebook string, assembled by the orchestrator from freshly-fetched issue bodies:
+
+```
+The spec for this branch is composite. The epic states the goal; each sub-issue below carries the
+acceptance criteria its implementer actually worked from, and a requirement is often written down
+ONLY at sub-issue level. Attack the gap between the union of these and the diff — a sub-issue AC that
+no code satisfies is a Spec defect even when the epic's own criteria all appear met.
+
+## Epic #<epic>: <title>
+<body and acceptance criteria>
+
+## Sub-issue #<n>: <title>   [landed as <sha>]
+<body and acceptance criteria>
+… one block per LANDED sub-issue …
+
+Sub-issues #<a>, #<b> did NOT land and are tracked separately as escalations. Ignore their acceptance
+criteria entirely — do not report them as gaps.
+```
+
+Two rules about assembling it:
+
+- **Fetch each sub-issue body from the tracker; never substitute the implementer's `summary`.** Act 1
+  returns one per sub-task, but it is the author's account of its own work. Grading the code against
+  it asks the author to set its own exam, and it agrees with the code by construction — precisely
+  where it diverges from the issue is the finding you wanted.
+- **Include landed sub-issues only, and name the rest.** A sub-task that escalated has unmet ACs by
+  design; re-reporting those as Spec defects buries the real gaps under noise the merger already knows
+  about from the epic comment.
 
 Keep its full output. Workflow B consumes the `CONFIRMED`/`PLAUSIBLE` findings; the `REFUTED` and
 `UNJUDGED` ones go straight to the final report.
@@ -671,15 +700,38 @@ if (ready.length) {
   })
 }
 
+// Act 1's results, needed by BOTH the discrepancy check (to know what was attempted) and the epic
+// comment below. Declared here rather than beside the comment: `const` is not hoisted, and reading
+// these from the prompt above would be a TDZ ReferenceError, not an undefined.
+const buildLanded = build?.landed ?? []
+const buildHitl = build?.hitl ?? []
+const buildFailed = build?.failed ?? []
+
 phase('Discrepancy check')
 const discrepancies = await tryAgent(
-  `Compare epic #${epic}'s spec (title, body, acceptance criteria) in ${repo} against what actually ` +
-    `landed on ${featureBranch}. The epic's contribution is exactly git -C ${repoPath} diff ${baseSha}...HEAD ` +
-    `and git -C ${repoPath} log ${baseSha}..HEAD — use that pinned SHA, not a branch name, so nothing landed ` +
-    `on ${baseBranch ?? 'the base branch'} by anyone else during the run can leak into or out of your view. ` +
-    `Read the closed sub-issues and their summary comments too. Report anything specified but not delivered, delivered but not ` +
-    `specified, or diverging from the spec's intent. The branch has already been red-teamed for defects — ` +
-    `you are checking coverage against the spec, not hunting bugs.`,
+  `Judge epic #${epic} in ${repo} against what actually landed on ${featureBranch}.\n\n` +
+    `THE EPIC IS THE STANDARD. Read its title, body, and acceptance criteria, and answer one question: ` +
+    `does what landed deliver what the epic asked for? Judge against the EPIC's criteria — not against ` +
+    `the sub-issues', which a separate review has already checked line by line. Your job is the altitude ` +
+    `they cannot see from: an epic requirement that no sub-issue ever covered is invisible to anyone ` +
+    `reading sub-issues, because it is missing from all of them. That decomposition gap is the single ` +
+    `most valuable thing you can find — a fleet can close every sub-issue perfectly and still not build ` +
+    `what was asked for.\n\n` +
+    `Read the sub-issues below as EVIDENCE of what was attempted and how the epic was decomposed — ` +
+    `never as the standard, and never as a substitute for reading the diff. Do not rely on the ` +
+    `implementers' summary comments for what was delivered: those describe what an author believed it ` +
+    `built, and agree with the code by construction.\n\n` +
+    `Landed: ${buildLanded.map((l) => `#${l.number}`).join(', ') || 'none'}.\n` +
+    `Did NOT land, already tracked as escalations: ${buildHitl.map((h) => `#${h.number}`).join(', ') || 'none'} — ` +
+    `where an epic criterion is unmet only because one of these stalled, say so in one line and move on; ` +
+    `the merger already knows.\n\n` +
+    `What landed is exactly git -C ${repoPath} diff ${baseSha}...HEAD and git -C ${repoPath} log ` +
+    `${baseSha}..HEAD — use that pinned SHA, not a branch name, so nothing landed on ` +
+    `${baseBranch ?? 'the base branch'} by anyone else during the run can leak into or out of your view.\n\n` +
+    `Report, against the epic: anything it specified that was not delivered (including anything no ` +
+    `sub-issue was ever filed for), anything delivered that it never asked for, and anything that ` +
+    `satisfies its wording while missing its intent. The branch has already been red-teamed for defects ` +
+    `and for per-sub-issue AC coverage — do not re-report either; you are judging the epic's goal.`,
   {
     schema: { type: 'object', properties: { discrepancies: { type: 'string' } }, required: ['discrepancies'] },
     label: 'discrepancy-check',
@@ -697,10 +749,6 @@ const discrepancyText =
 // "minor issues remain" — and this comment is what someone reads instead of re-deriving the state of
 // a branch they did not build.
 phase('Report to epic')
-
-const buildLanded = build?.landed ?? []
-const buildHitl = build?.hitl ?? []
-const buildFailed = build?.failed ?? []
 
 const tally = {}
 for (const f of findings) {
@@ -781,7 +829,7 @@ if (skipped.length) {
   md.push(skipped.map((s) => `- \`${s.file}\` ${s.id} — ${s.reason}`).join('\n'))
 }
 
-md.push(`### Spec coverage`)
+md.push(`### Does this deliver the epic?`)
 md.push(discrepancyText)
 md.push(`<sub>Posted by orchestrate-implementation. The epic stays open — merging is a human step.</sub>`)
 
@@ -901,6 +949,16 @@ alone with the same `findings` — act 1's work is already on the branch.
   call also excludes already-*assigned* issues, which is what keeps a sub-task claimed in an earlier,
   still-in-flight round from being re-claimed by a later round's pipeline — assignment doubles as the
   concurrency guard, dependency status doubles as the ordering guard.
+- **The two spec checks sit at different altitudes, and must not be given the same input.** The Spec
+  lens gets the composite spec — epic plus every landed sub-issue's ACs — and asks, per AC, whether
+  code satisfies it. The discrepancy check gets the **epic only** as its standard and asks whether the
+  branch delivers what the epic asked for. An intermediate draft made both composite, which was a
+  mistake: it turned the discrepancy check into a coarser second copy of the Spec lens and gave up the
+  one failure only it can catch — an epic requirement that *no sub-issue was ever filed for*. That gap
+  is invisible to anything reading sub-issue ACs precisely because it is absent from all of them, and
+  it is the characteristic way a parallel fleet fails: every child closes green, the parent is still
+  not built. So the discrepancy check reads sub-issues as evidence of what was attempted and how the
+  epic was decomposed, never as the criteria it grades against.
 - **The epic gets a comment; the script writes it, an agent only posts it.** An earlier draft never
   wrote to the epic at all — it read the epic three times and wrote to it zero times, so a whole run
   (sub-tasks landed, five lenses attacked, fixes applied, spec gaps found) existed only in the

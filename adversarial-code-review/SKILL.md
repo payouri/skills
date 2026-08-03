@@ -51,6 +51,11 @@ Security invokes a bundled skill, so **Spec** is the only lens that can come up 
 or spec found makes it unavailable — name that to the user and let them drop it or point you at the
 spec. An attacker never infers the requirements it is meant to be checking against.
 
+Spec is also the only lens whose rulebook can be **incomplete without looking it**. When the fixed
+point spans several issues, the spec is the union of all of them — the parent states the goal, its
+children carry the acceptance criteria the code was written against. Gather them all; REFERENCE.md
+§ Lens rulebooks has the rules for assembling a composite spec.
+
 Done when every chosen lens carries a rulebook instruction, or Spec has been dropped.
 
 ## 4. Attack, then refute
