@@ -122,13 +122,17 @@ const VERDICTS = {
   },
 }
 
+// `args` arrives as a JSON string on some hosts and as an object on others; parse defensively or
+// `pipeline(input.lenses)` throws before a single agent spawns.
+const input = typeof args === 'string' ? JSON.parse(args) : args
+
 const attack = (lens) => `You are red-teaming a code change on ONE lens: ${lens.name} — ${lens.question}
 
 ${lens.rulebook}
 
-The change: \`${args.diff.command}\`
+The change: \`${input.diff.command}\`
 Commits:
-${args.diff.log}
+${input.diff.log}
 
 Read the diff, then read enough of the surrounding code to know how the changed lines behave in
 context — the diff alone hides callers, defaults, and which paths reach them.
@@ -143,7 +147,7 @@ you, so \`claim\` should state the defect and \`rationale\` should carry the cas
 
 const refute = (lens, claims) => `Fresh eyes on a code change. Someone claims the defects below on the ${lens.name} lens. You have their claims and nothing else — their reasoning is deliberately withheld, so reach your own.
 
-The change: \`${args.diff.command}\`
+The change: \`${input.diff.command}\`
 
 Claims:
 ${claims.map((c) => `- id: ${c.id}\n  claim: ${c.claim}\n  at: ${c.location}\n  hunk: ${c.hunk}\n  they say it fails when: ${c.failureScenario}`).join('\n')}
@@ -161,7 +165,7 @@ CONFIRMED means you reproduced the reasoning, not that the claim sounds right �
 neither reproduce nor kill is PLAUSIBLE. Return exactly one verdict per id above, inventing no ids.`
 
 const results = await pipeline(
-  args.lenses,
+  input.lenses,
   (lens) => agent(attack(lens), { label: `attack:${lens.name}`, phase: 'Attack', schema: FINDINGS }),
   (found, lens) => {
     const findings = found?.findings ?? []
