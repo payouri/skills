@@ -170,6 +170,10 @@ const failed = []
 // Sweep can reconcile reality against intent. Cleanup delegated to the reviewer alone is cleanup that
 // silently doesn't happen when the reviewer dies — which is exactly what the first real run hit.
 const worktrees = []
+// Issues this run has delivered on a branch. They stay OPEN by design, so the tracker keeps reporting
+// them as live blockers — Discover is handed this list each round and told to treat them as satisfied.
+// Without it the round loop can only ever re-find round 1's frontier. See SKILL.md's starvation rule.
+const delivered = []
 let round = 0
 const MAX_ROUNDS = 20
 
@@ -183,7 +187,12 @@ while (round < MAX_ROUNDS) {
       `assignee, and not blocked. An assignee means an earlier round already has it in flight — skip it, ` +
       `never re-claim it. Blocked means an open native issue dependency (gh api .../issues/<n> — check ` +
       `issue_dependencies_summary.blocked_by > 0) or an open issue referenced in a "Blocked by:" line in ` +
-      `the body. If you cannot confirm the "${readyLabel}" label actually exists in this repo (gh label list), ` +
+      `the body — EXCEPT for these issues, already delivered on a branch by this run, which you must treat ` +
+      `as satisfied blockers even though they are still open: ` +
+      `${delivered.length ? delivered.map((n) => `#${n}`).join(', ') : '(none yet)'}. Nothing is ever closed ` +
+      `here, so a blocker's state never changes; without that exception a dependent issue can never be ` +
+      `discovered and part of the backlog is dropped in silence. ` +
+      `If you cannot confirm the "${readyLabel}" label actually exists in this repo (gh label list), ` +
       `set labelResolved=false and return an empty tasks array — do NOT substitute a similar-looking label ` +
       `or fall back to listing all open issues. For each task, estimate complexity from its title/body alone: ` +
       `"standard" if it touches a core public API, unsafe code, an ADR-covered area, or a wide file footprint; ` +
@@ -212,7 +221,7 @@ while (round < MAX_ROUNDS) {
   const results = await pool(discovery.tasks, LANES, async (task) => {
     const claim = await tryAgent(
       `Claim GitHub issue #${task.number} in ${repo}: gh issue edit ${task.number} --add-assignee @me. ` +
-        `Then create an isolated worktree for it: git worktree add ../wt-issue-${task.number} -b ` +
+        `Then create an isolated worktree for it: git worktree add ../.afk-worktrees/issue-${task.number} -b ` +
         `afk/issue-${task.number} trunk — branched off the current tip of trunk, NOT off any other branch ` +
         `and NOT off another issue's branch. If trunk cannot be verified (git rev-parse --verify trunk), or ` +
         `the worktree path or branch name already exists, set ok=false with a reason and stop — do not invent ` +
@@ -235,9 +244,17 @@ while (round < MAX_ROUNDS) {
         `Work ONLY inside that worktree — never touch the primary checkout or another worktree. ` +
         `Do NOT invoke /code-review yourself; a separate reviewer agent handles that. Do NOT merge, ` +
         `rebase onto trunk, push, or open a PR — your branch is the deliverable and integration is a human ` +
-        `step. When done, squash your work into one commit on ${claim.branch} following the repo's ` +
-        `conventional-commit convention with an issue reference in the body, then invoke /handoff to write a ` +
-        `handoff document (what you built, key decisions, where the diff is). Return the handoff text and the ` +
+        `step. If /implement or /handoff is not invocable as a skill in this session, read its SKILL.md and ` +
+        `follow it directly rather than improvising.\n\n` +
+        `The worktree may ALREADY hold uncommitted changes and a residual commit, from an earlier ` +
+        `implementer that was killed mid-run and whose work was preserved so nothing was lost. Do not ` +
+        `trust it and do not assume it is finished: read the diff against ${claim.baseSha} first, keep what ` +
+        `is right, and redo what is not.\n\n` +
+        `When done, squash your work into one commit on ${claim.branch} following the repo's ` +
+        `conventional-commit convention. Reference the issue as "Refs #${task.number}" — NOT ` +
+        `"Closes"/"Fixes"/"Resolves", which would close the issue the moment this reaches the default ` +
+        `branch and this fleet leaves integration to a human. Then invoke /handoff to write a handoff ` +
+        `document (what you built, key decisions, where the diff is). Return the handoff text and the ` +
         `commit SHA.`,
       {
         phase: 'Implement',
@@ -322,6 +339,8 @@ while (round < MAX_ROUNDS) {
         residualCommit: review.residualCommit,
         worktreeRemoved: review.worktreeRemoved !== false,
       })
+      // Feeds the next round's Discover so this issue stops counting as a live blocker.
+      delivered.push(task.number)
     }
     if (review.hitl?.triggered) {
       hitl.push({ number: task.number, title: task.title, reason: review.hitl.reason })
@@ -339,7 +358,10 @@ const sweep = worktrees.length
   ? await tryAgent(
       `Final cleanup for the fleet. These worktrees were created during this run:\n` +
         worktrees.map((w) => `- #${w.number}: ${w.path} on branch ${w.branch} (based on ${w.baseSha})`).join('\n') +
-        `\n\nRun git worktree list from the primary checkout and reconcile. For each one that STILL EXISTS:\n` +
+        `\n\nRun git worktree list from the primary checkout and reconcile against THAT LIST ONLY. Other ` +
+        `worktrees this fleet did not create are common and may be long-lived — anything present in ` +
+        `pre-flight's snapshot is somebody else's, so leave it completely alone. For each FLEET worktree ` +
+        `that STILL EXISTS:\n` +
         `1. Inspect it: git -C <path> status --porcelain and git -C <path> log --oneline <base>..HEAD.\n` +
         `2. If anything is uncommitted or untracked, commit it onto that worktree's own branch as ` +
         `"chore(wip): unrecovered work from #<n>". Losing work is never an acceptable way to clean up, and ` +
@@ -387,6 +409,26 @@ return {
 }
 ```
 
+## Classify the failure before recovering
+
+Three failures look identical from the outside — the run ends early and something is `null` — and they
+want three different responses. Read `journal.jsonl` first and count.
+
+| Shape                                                                          | Cause        | Response                    |
+| ------------------------------------------------------------------------------ | ------------ | --------------------------- |
+| Many agents dead at once, mid-run, provider errors in the transcripts          | **overload** | resume with `retryAfterMs`  |
+| Exactly one agent aborted, near the hour mark, every other lane complete       | **deadline** | reset that issue, fresh run |
+| One agent dead, the fleet carried on, other lanes still finished after it       | agent fault  | resume                      |
+
+**A deadline is not a resume.** The wall clock stops the run, not the work, so resuming replays the
+cache straight into the same wall. Worse, the aborted issue is left in a state that blocks its own
+retry three ways: still **assigned** so Discover skips it, holding an **empty branch** so a re-claim
+fails on the existing name, and holding a **live worktree** so the path is taken too. Reset all three —
+unassign, delete the zero-commit branch, let the Sweep or a manual `git worktree remove` take the
+checkout — and comment on the issue that it was aborted before any code was written. The next run then
+discovers it normally. Two consecutive runs in one session hit exactly this, each at ~58 minutes, each
+losing whichever task happened to be in flight.
+
 ## Resuming after a partial failure
 
 A fleet-wide API failure kills every in-flight agent at once, so the usual shape of a bad run is
@@ -397,8 +439,17 @@ survive — recover, don't restart:
    value, so it tells you which stages really completed. Don't infer it from the error, and don't
    assume a cached result is non-empty.
 2. **Check every worktree's state** — `git -C <wt> status --porcelain` and `git -C <wt> log --oneline -1`.
-   A reviewer killed mid-fix leaves uncommitted changes; that partial work must be re-reviewed, never
-   committed on trust. The review prompt already tells the resumed reviewer this.
+   Both halves of the fleet can die dirty, and the two cases need opposite handling:
+   - A **killed reviewer** leaves uncommitted fixes on top of a committed implementation. That partial
+     work must be re-reviewed, never committed on trust; the review prompt already tells the resumed
+     reviewer so.
+   - A **killed implementer** leaves residue and an _empty branch_ — nothing committed at all. The
+     implement call is about to re-run live into that dirty tree, and you cannot fix it by editing the
+     implement prompt at resume time: that changes the key for the sibling lane's completed implement
+     call too, re-running twenty minutes of finished work. So commit the residue as
+     `chore(wip): recovered from a killed implementer` on its own branch before resuming. The re-run
+     then starts from a clean tree with the prior progress on the branch, and squashes over it. The
+     implement prompt tells it to distrust what it finds.
 3. **Edit the persisted script, then resume**: `Workflow({ scriptPath, resumeFromRunId })`. The
    longest unchanged prefix of `agent()` calls replays from cache, so successful implementations cost
    nothing on the second pass.
@@ -447,6 +498,23 @@ survive — recover, don't restart:
   The script can't read a `Retry-After` header (it never sees the HTTP response), so when the
   orchestrator observed one, it passes `retryAfterMs` and that becomes the floor. Retries reuse a
   byte-identical prompt so `resumeFromRunId` still matches the cache.
+- **`park` and `land` are the two endpoints, and one word each is the point.** The prohibition list in
+  the reviewer prompt ("do NOT merge, rebase, fast-forward, cherry-pick, push, or open a PR") stays,
+  because a bare positive instruction gets helpfully corrected: an Opus agent that has just fixed review
+  findings reaches for `--ff-only` on its own, since that is what every other workflow in a repo rewards.
+  Naming the ban with its reason is a guardrail. But it belongs in the _prompt_, once — SKILL.md says
+  `park` and moves on, and [LANDING.md](LANDING.md) holds the other endpoint. Restating the ban at
+  three sites is how the rule got long enough to look negotiable.
+- **An unclosed blocker starves its dependents, and the round loop hides it.** Discover filters on
+  `blocked_by > 0` and nothing is ever closed, so a blocker's state never changes and its dependents can
+  never enter the frontier. Left unhandled, the loop re-finds round 1's frontier, hits its dry-frontier
+  branch, and reports "fleet done" over a backlog it silently dropped — observed live: a nine-issue
+  label yielded a five-issue frontier, and the missing four only surfaced after their blockers were
+  closed by hand. Hence the `delivered` array threaded into the Discover prompt each round.
+- **`Refs`, not `Closes`.** Two reviewers in separate lanes independently noticed the implementer's
+  `Closes #<n>` trailer and rewrote it, because that trailer closes the issue the moment it reaches the
+  default branch. The same discovery twice is a rule missing from the implement prompt, not diligence
+  to be admired.
 - **Assignment is the concurrency guard; the label is the queue.** Discover excludes assigned issues,
   so an issue claimed in round 1 can't be re-claimed in round 2, and a human adding the label
   mid-run gets picked up by the next round. Dependency status is the ordering guard. Neither is a
