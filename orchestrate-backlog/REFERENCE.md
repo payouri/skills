@@ -307,7 +307,7 @@ while (round < MAX_ROUNDS) {
         `exist with your commit on it. Report worktreeRemoved accordingly — report it honestly as false if ` +
         `removal genuinely failed, so the Sweep phase can finish the job.\n\n` +
         `Handoff:\n${impl.handoff}`,
-      { phase: 'Review & Fix', schema: REVIEW_SCHEMA, label: `review:${task.number}`, model: 'opus' }
+      { phase: 'Review & Fix', schema: REVIEW_SCHEMA, label: `review:${task.number}`, model: 'opus', effort: 'medium' }
     )
 
     if (!review) {
@@ -414,20 +414,39 @@ return {
 Three failures look identical from the outside — the run ends early and something is `null` — and they
 want three different responses. Read `journal.jsonl` first and count.
 
-| Shape                                                                          | Cause        | Response                    |
-| ------------------------------------------------------------------------------ | ------------ | --------------------------- |
-| Many agents dead at once, mid-run, provider errors in the transcripts          | **overload** | resume with `retryAfterMs`  |
-| Exactly one agent aborted, near the hour mark, every other lane complete       | **deadline** | reset that issue, fresh run |
-| One agent dead, the fleet carried on, other lanes still finished after it       | agent fault  | resume                      |
+| Shape                                                                    | Cause        | Response                            |
+| ------------------------------------------------------------------------ | ------------ | ----------------------------------- |
+| Many agents dead at once, mid-run, provider errors in the transcripts    | **overload** | resume with `retryAfterMs`          |
+| One agent dead, the fleet carried on, other lanes finished after it      | **stall**    | resume if it died late, else reset  |
+| The whole run gone, nothing after a point                               | **crash**    | recover residue first, then decide  |
 
-**A deadline is not a resume.** The wall clock stops the run, not the work, so resuming replays the
-cache straight into the same wall. Worse, the aborted issue is left in a state that blocks its own
-retry three ways: still **assigned** so Discover skips it, holding an **empty branch** so a re-claim
-fails on the existing name, and holding a **live worktree** so the path is taken too. Reset all three —
-unassign, delete the zero-commit branch, let the Sweep or a manual `git worktree remove` take the
-checkout — and comment on the issue that it was aborted before any code was written. The next run then
-discovers it normally. Two consecutive runs in one session hit exactly this, each at ~58 minutes, each
-losing whichever task happened to be in flight.
+**There is no wall-clock deadline — stop reaching for one.** The runtime's documented limits are 16
+concurrent agents, 1000 agents per run, and the prompt-cache stagger. Duration is not among them, and
+this project's own history bears that out: runs of 111 and 133 minutes completed normally, spawning
+fresh agents at +84 and +125 minutes. An earlier version of this file blamed a "~1h cutoff" on two
+consecutive runs that ended at ~58 minutes; measured from their transcripts they ran 58 and **68**
+minutes, and across eleven runs the agents that never returned died at +1, +7, +12, +36, +56, +58 and
++125 minutes. That is not a deadline. It is noise, and it is uniform.
+
+**What actually kills a lone agent is a stall.** `CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS` defaults to
+600000 — ten minutes — and its timer resets on every streaming progress event. An agent that emits
+nothing for that long is aborted, marked failed, and its partial result surfaces to the parent; the
+siblings never notice. That is precisely the shape this table's middle row describes, and it explains
+why the abort arrives as a bare `AbortError` with no provider error behind it. Related but larger
+knobs, in case a run is dying against them instead: `API_TIMEOUT_MS` (10 min per request) and
+`API_FORCE_IDLE_TIMEOUT` (a 5-minute body-idle abort on non-direct providers).
+
+**Whether to resume turns on start order, not on cause.** See the next section — replay stops at the
+first unfinished agent and discards everything spawned after it. A stalled reviewer in the run's last
+lane is worth resuming; a claim agent that died at +1 minute of a 30-minute run is not, because
+resuming re-runs the fourteen agents that succeeded after it.
+
+**When you reset instead, reset all three holds.** An issue abandoned mid-implement blocks its own
+re-claim three ways: still **assigned** so Discover skips it, holding an **empty branch** so a
+re-claim fails on the existing name, and holding a **live worktree** so the path is taken too.
+Unassign, delete the zero-commit branch, let the Sweep or a manual `git worktree remove` take the
+checkout, and comment on the issue that it was aborted before any code was written. The next run then
+discovers it normally.
 
 ## Resuming after a partial failure
 
@@ -450,13 +469,27 @@ survive — recover, don't restart:
      `chore(wip): recovered from a killed implementer` on its own branch before resuming. The re-run
      then starts from a clean tree with the prior progress on the branch, and squashes over it. The
      implement prompt tells it to distrust what it finds.
-3. **Edit the persisted script, then resume**: `Workflow({ scriptPath, resumeFromRunId })`. The
-   longest unchanged prefix of `agent()` calls replays from cache, so successful implementations cost
-   nothing on the second pass.
-4. **Keep surviving prompts byte-identical.** The cache keys on `(prompt, opts)` in call order —
-   reword a prompt and that call plus everything after it re-runs live. Adding a wrapper around
-   `agent()` is safe; changing the string it receives is not.
-5. **If the failure was rate/overload-driven, pass `retryAfterMs`** from whatever the provider asked
+3. **Price the resume before you run it.** Two documented rules govern replay, and the second is the
+   one that decides whether resuming is worth anything at all:
+   - an agent still running when the run stopped is not saved, so it starts over;
+   - **replay follows the order agents started, and cached results stop at the first agent that
+     didn't finish — every agent started after that one re-runs, even though it completed.**
+
+   A fleet is a fan-out, which is the worst case for that rule: lanes start their claims within
+   seconds of each other, so an agent that dies early sits near the front of the start order and
+   takes the whole run down with it on replay. Read `journal.jsonl` and find where the dead agent
+   falls in start order first. Late — the last reviewer, the Sweep — resume and pay almost nothing.
+   Early — a round-1 claim or implement — a "resume" re-runs the entire fleet live at full cost, and
+   you are better off resetting that one issue and starting a fresh run, which at least rediscovers
+   the frontier and skips the work already parked on branches.
+4. **Edit the persisted script, then resume**: `Workflow({ scriptPath, resumeFromRunId })`. Keep
+   surviving prompts byte-identical — the cache keys on `(prompt, opts)` in call order, so rewording
+   a prompt invalidates that call and everything after it on top of the start-order rule above.
+   Adding a wrapper around `agent()` is safe; changing the string it receives is not.
+5. **Resume is same-session only.** Exiting Claude Code with a run in flight means the next session
+   starts it fresh — there is no cache to come back to. If the session is ending, the branches are the
+   only thing that carries the work forward, which is the whole reason every exit path commits.
+6. **If the failure was rate/overload-driven, pass `retryAfterMs`** from whatever the provider asked
    for before resuming, and consider dropping `maxParallel` for the retry — four Opus reviewers
    starting within seconds of each other is itself part of the load.
 
@@ -472,12 +505,37 @@ survive — recover, don't restart:
   has just fixed review findings will reach for `rebase`/`--ff-only` on its own, because that is what
   every other workflow in this repo asks for. The prohibition is spelled out as an explicit list, with
   the reason, because a bare "don't merge" reads as an oversight to be helpfully corrected.
+- **The reviewer's effort is pinned, not inherited — `medium` is the default.** `opts.effort` defaults to
+  the session's reasoning effort when omitted, which means the same script reviews at a different depth
+  depending on whoever launched it: a fleet run is then not reproducible, and the one stage whose
+  judgment the whole design leans on is the stage whose depth is least under the script's control.
+  `model: 'opus'` is already pinned for exactly that reason; leaving `effort` floating undoes half of it.
+  So state it. `medium` is the right default because the reviewer is mostly *driving a defined
+  procedure* — `/code-review`'s two axes, which fan out into their own sub-agents — rather than reasoning
+  open-endedly from scratch, and Opus at `medium` clears that bar comfortably.
+  It is a **floor, not a ceiling**: raise it to `'xhigh'` or `'max'` for a backlog whose issues are
+  security-sensitive, concurrency-heavy, or touching a core public API, where the adversarial read is
+  the actual product. Raise it deliberately, though — and note that changing `effort` changes an
+  `agent()` call's cache key, so adding it to a run you intend to `resumeFromRunId` re-runs every review
+  live instead of replaying it.
+
 - **A hand-rolled pool, not `pipeline()`.** `pipeline()` runs every item concurrently up to
   Workflow's own cap (`min(16, cores-2)`), which would put 16 issues in flight — the opposite of a
   4-task limit. The pool keeps per-item stage chaining (claim → implement → review runs sequentially
   *within* a lane, exactly as a pipeline would) while bounding how many lanes exist. `Promise.all` over
-  lane functions is fine here; `Date.now`/`Math.random` are not available in Workflow scripts, so
-  don't reach for jitter or timestamps.
+  lane functions is fine here.
+- **What the script runtime actually gives you, probed rather than assumed.** `Date.now()`,
+  `new Date()` and `Math.random()` are rejected **twice** — a static scan refuses the script before it
+  starts if the text merely contains them, and a runtime stub throws if you route around the scan via
+  `globalThis.Date`. `performance` and `process` do not exist. `setTimeout` exists; **`setInterval`
+  does not**, so the `pause` helper above is the only timing primitive, and a retry loop must not
+  reach for an interval. `budget.spent()` works even when no `+Nk` budget was set (`budget.total` is
+  `null` and `remaining()` is `Infinity`), which makes token spend the one always-available measure of
+  how far a run has got. Elapsed wall clock *is* recoverable if you ever need it — awaiting `setTimeout`
+  in a loop and counting ticks measures real time, verified accurate over a 2s probe — but with no
+  duration limit to race there is nothing for a fleet to spend it on. Don't add a clock or a static
+  task budget to beat a deadline that doesn't exist; `MAX_ROUNDS` and the dry-frontier check are the
+  run's real termination conditions.
 - **Agent count scales with the backlog.** Three agents per issue plus one discovery agent per round:
   a 6-issue run is ~19 agents, above the default "keep it under 15" guideline. That's inherent to
   draining a backlog, not an accident — mention the expected count when the frontier is large, and

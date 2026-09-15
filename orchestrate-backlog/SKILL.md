@@ -38,8 +38,13 @@ yourself reaching for `Edit`/`Write`/`git commit` on the target repo, stop: that
   its diffs — say so before claiming anything.
 - Snapshot `git worktree list`. Long-lived worktrees that aren't the fleet's are common, and the
   Sweep reconciles against this snapshot rather than assuming every checkout it finds is its own.
-- Size the run to the wall clock: a `Workflow` run is cut off after roughly an hour, so plan for
-  about **three tasks per run** and tell the user a large frontier takes several runs.
+- Size the run — but not to a wall clock. **There is no per-run duration limit.** The documented
+  runtime caps are 16 concurrent agents, a 1000-agent backstop, and the prompt-cache stagger; time
+  is not among them, and runs of 111 and 133 minutes have completed normally. What actually bites is
+  per-agent: `CLAUDE_ASYNC_AGENT_STALL_TIMEOUT_MS` (10 min, resets on each streaming progress event)
+  aborts **one** subagent that has gone quiet and lets its siblings run on. Size the run by what a
+  stop would cost instead — see the resume economics in [REFERENCE.md](REFERENCE.md) — and tell the
+  user a large frontier takes several runs.
 - Resolve `maxParallel`: 4 unless the user asked for a different number.
 - No branch to create. Each task creates its own; there is no shared integration branch.
 
@@ -102,9 +107,10 @@ entry point.
 - **A dead agent degrades one lane, never the fleet — and know which death it is.** `agent()` returns
   `null` rather than throwing, so null-check every stage inside the lane and let nothing after the pool
   dereference an unchecked value. An **overload** kills every in-flight agent at once and wants
-  escalating backoff, honoring any `Retry-After` the provider gave. A **deadline** — one aborted agent
-  near the hour mark, every other lane complete — wants a reset, not a retry; backing off there only
-  spends what's left of the run asleep. REFERENCE.md's `tryAgent` wrapper is not optional.
+  escalating backoff, honoring any `Retry-After` the provider gave. A **stall** kills exactly one agent
+  — the harness aborts a subagent that emits no streaming progress for 10 minutes — and it strikes at
+  any point in a run, not near any particular mark; a retry is right there, and `tryAgent` gives it one.
+  REFERENCE.md's `tryAgent` wrapper is not optional.
 
 ## 3b. If the run fails partway
 
@@ -114,8 +120,11 @@ Both halves of the fleet die dirty in different ways — a killed reviewer leave
 implementation, a killed implementer leaves residue and an _empty branch_ — and residue must be
 committed to its branch before a resume re-runs live into that tree.
 
-A **deadline** is not a resume: the aborted issue is left assigned, with an empty branch and a live
-worktree, and all three block a retry. Reset it and let the next run rediscover it.
+Then decide between resume and reset on **start order**, not on the clock. Replay stops at the first
+agent that didn't finish and re-runs everything started after it, even work that completed — so a
+resume is cheap only when the dead agent was among the last spawned, and near-worthless when it died
+early. An issue abandoned mid-implement is also left assigned, holding an empty branch and a live
+worktree, and all three block a re-claim: reset those and let the next run rediscover it.
 
 Procedures for both in [REFERENCE.md](REFERENCE.md).
 
@@ -130,8 +139,8 @@ Once the workflow returns, give the user exactly four sections:
   delivered-but-unspecified.
 - **HITL escalations** — every issue whose review stopped early and why, or "none". Their work is on
   their branch too; say what state it's in.
-- **Summary** — issues attempted, models used, rounds run, whether the round cap or the **wall clock**
-  ended the run, and the Sweep result. State plainly whether `git worktree list` is back to
+- **Summary** — issues attempted, models used, rounds run, what ended the run (a dry frontier, the
+  round cap, or a failure), and the Sweep result. State plainly whether `git worktree list` is back to
   pre-flight's snapshot; if anything survived, name the paths rather than implying a tidy finish. Name
   any issue the run never reached, and any left aborted-and-reset. If earlier runs left branches now
   fully merged into trunk, say so and offer `git branch -d` — safe by construction, since it refuses
