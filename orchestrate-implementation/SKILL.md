@@ -18,7 +18,7 @@ The run is **three acts, orchestrator in the loop between each**:
 | Act              | What runs                                                              | Who reviews                |
 | ---------------- | ---------------------------------------------------------------------- | -------------------------- |
 | **1. Build**     | Workflow A — discover → claim → implement → integrate, looped           | nobody                     |
-| **2. Attack**    | `/adversarial-code-review` over the whole feature branch, all five lenses | 5 attackers + 5 refuters |
+| **2. Attack**    | `adversarial-code-review` over the whole feature branch, all five lenses | 5 attackers + 5 refuters |
 | **3. Repair**    | Workflow B — tiered fixers for every non-refuted finding, discrepancy check, then the epic comment | nobody |
 
 Review is **branch-wide and once**, not per-sub-task. An implementer implements and stops; nothing
@@ -79,12 +79,15 @@ Run Workflow A from [REFERENCE.md](REFERENCE.md) § Workflow A. It:
 
 ## 2. Act 2 — attack
 
-Invoke `/adversarial-code-review` and follow its own SKILL.md §1–§4 against the assembled branch:
+Read `adversarial-code-review`'s own `SKILL.md` — the sibling skill, at
+`../adversarial-code-review/SKILL.md` — and run its §1–§4 yourself against the assembled branch. It
+is user-invoked (`disable-model-invocation: true`), so it answers only to a person typing its name:
+act 2 is you executing its procedure and reading its rulebooks off disk, not a `/` call.
 
 - **Fixed point**: the `baseSha` pinned in step 0 — not a branch name. `git diff <baseSha>...HEAD`
   from the run's worktree is the epic's whole contribution and nothing else.
 - **Foreign commits**: `git log --format=%H <baseSha>..HEAD` should hold exactly act 1's `landed`
-  SHAs. Anything else was written by another process. Name those SHAs in the review invocation and in
+  SHAs. Anything else was written by another process. Name those SHAs in the review's inputs and in
   the final report, so no finding raised against them is attributed to this epic — then **run the
   review anyway**. `baseSha` pins the base against drift; it cannot stop a commit landing on the
   feature branch, and halting here leaves the branch unreviewed on top of unexplained.

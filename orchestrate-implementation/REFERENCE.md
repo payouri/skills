@@ -1,6 +1,6 @@
 # Workflow script templates
 
-Two scripts, run in that order with act 2 — `/adversarial-code-review` — between them:
+Two scripts, run in that order with act 2 — `adversarial-code-review` — between them:
 
 - **Workflow A — build**: discover → claim → implement → serial integrate, looped until dry.
 - **Workflow B — repair**: triage → fix in worktrees → serial integrate → discrepancy check.
@@ -381,7 +381,8 @@ return { landed, hitl, failed, roundsUsed: round }
 
 ## Act 2 — the review, between the workflows
 
-Not a script. Invoke `/adversarial-code-review` and follow its SKILL.md, with:
+Not a script, and not a `/` call — `adversarial-code-review` is user-invoked, so act 2 is you reading
+the sibling skill's `SKILL.md` and running its §1–§4 yourself, with:
 
 - **fixed point** `baseSha` — the SHA pinned in step 0, never a branch name — verified from `repoPath`
   where `featureBranch` is checked out. Its §1 check is `git rev-parse <baseSha>` and
@@ -960,7 +961,7 @@ alone with the same `findings` — act 1's work is already on the branch.
   the checkout isn't shared, another run is a curiosity rather than a threat.
 - **The refute stage is why fixes can be automated.** A per-sub-task reviewer that also fixed what it
   found was its own judge — nothing tested whether the finding was real before the code changed.
-  `/adversarial-code-review` runs a fresh refuter per lens that never sees the attacker's reasoning, so
+  `adversarial-code-review` runs a fresh refuter per lens that never sees the attacker's reasoning, so
   by the time a finding reaches a fixer it has already survived a hostile second reading. `REFUTED`
   never reaches a fixer; `UNJUDGED` never does either, because a dropped verdict is not a survived one.
 - **Fixers are tiered by fix complexity, not defect severity.** These are independent axes: a blocker
