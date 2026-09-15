@@ -37,10 +37,22 @@ is for.
 - Resolve the **base branch** — whatever this repo integrates into, and whatever it calls it: `trunk`,
   `main`, `master`, a release branch, or the epic's own parent branch if the work nests. Read it from
   the repo's docs or `git symbolic-ref refs/remotes/origin/HEAD`; never assume the name.
-- Create the feature branch off the base branch if it doesn't exist (local, never pushed) and **check
-  it out in the primary repo**. It stays checked out there for the whole run: the integrator merges
-  into it, and acts 2–3 diff against it. Sub-tasks and fixes live in worktrees; nothing but the
-  integrator writes to the primary checkout.
+- Create the feature branch off the base branch if it doesn't exist (local, never pushed), then give
+  this run **its own worktree** for it — `git worktree add <repo>/../epic-<n> <featureBranch>` — and
+  pass that path as `repoPath`. The integrator merges there and acts 2–3 diff there; sub-tasks and
+  fixes take their own worktrees off it. Remove it after the final report, not before: acts 2 and 3
+  both read from it.
+
+  The primary clone is shared mutable state — the user works in it, and another orchestration may be
+  driving a different epic through it right now. Two runs **racing** one HEAD interleave their
+  merges, and each lands work on whichever branch the other last checked out. A run that owns its
+  worktree cannot have its HEAD swapped underneath it, and that is a guarantee no amount of checking
+  buys in a shared one.
+- **Report what else is live, then carry on.** `git worktree list` for other `feature/epic-*`
+  checkouts or stray `wt-subtask-*` directories, and `git reflog -n 20` for `merge subtask-*` entries
+  that aren't yours. Name whatever you find in the final report — a concurrent run explains surprises
+  later — and keep going. Owning your worktree is what makes another run harmless, so finding one is
+  information, not a reason to stop.
 - **Pin the fixed point now, as a SHA**: `git rev-parse <featureBranch>` before a single sub-task
   lands. That commit — call it `baseSha` — is what act 2 reviews against and act 3 measures against,
   and it is the one thing that stays correct no matter what the base branch is named or how it moves
@@ -70,7 +82,12 @@ Run Workflow A from [REFERENCE.md](REFERENCE.md) § Workflow A. It:
 Invoke `/adversarial-code-review` and follow its own SKILL.md §1–§4 against the assembled branch:
 
 - **Fixed point**: the `baseSha` pinned in step 0 — not a branch name. `git diff <baseSha>...HEAD`
-  from the primary checkout is the epic's whole contribution and nothing else.
+  from the run's worktree is the epic's whole contribution and nothing else.
+- **Foreign commits**: `git log --format=%H <baseSha>..HEAD` should hold exactly act 1's `landed`
+  SHAs. Anything else was written by another process. Name those SHAs in the review invocation and in
+  the final report, so no finding raised against them is attributed to this epic — then **run the
+  review anyway**. `baseSha` pins the base against drift; it cannot stop a commit landing on the
+  feature branch, and halting here leaves the branch unreviewed on top of unexplained.
 - **Lenses**: all five — Bugs, Maintainability, Security, Standards, Spec. Pass them explicitly so
   its §2 `AskUserQuestion` does not fire.
 - **Spec rulebook**: a **composite spec** — the epic's body and acceptance criteria, *plus the body
@@ -175,7 +192,13 @@ reads as in-progress and gets skipped by later rounds on the assignee alone.
   defects.
 - **One worktree per sub-task and per fix group**, removed once its branch has landed. Never shared
   between two units of work running concurrently.
-- **Only the integrator writes to the feature branch**, and only serially. Rebase, then `--ff-only`.
+- **Only the integrator writes to the feature branch**, and only serially, in the run's own worktree.
+  Rebase, then `--ff-only`.
+- **The integrator verifies HEAD, not the branch's existence.** `git merge` lands on HEAD, so
+  `rev-parse --verify <featureBranch>` passes for a branch that exists but is checked out nowhere — a
+  guard that reads as safety while measuring nothing that constrains the merge. `rev-parse
+  --abbrev-ref HEAD` must equal the feature branch; anything else is HITL, and the integrator never
+  runs `checkout` to make it match.
 - **The integrator never resolves a conflict.** On any conflict it aborts the rebase, leaves the
   branch unmerged, and reports HITL. A guessed resolution corrupts the branch silently; a stalled
   sub-task doesn't.
@@ -202,6 +225,11 @@ completed, inspect each worktree for uncommitted work a killed agent left, then
 `Workflow({ scriptPath, resumeFromRunId })` so completed stages replay from cache. Keep surviving
 prompts byte-identical or they re-run live. Full procedure in [REFERENCE.md](REFERENCE.md).
 
+When you do restart fresh instead, **seed the sub-tasks that already landed** into the script's
+`landed` array with their real SHAs. Their issues are closed, so Discover will never surface them
+again — but their code is on the branch and inside act 2's diff, so an unseeded run reviews work its
+own report never mentions.
+
 ## 5. Final report
 
 Once act 3 returns, give the user exactly five sections:
@@ -212,7 +240,8 @@ Once act 3 returns, give the user exactly five sections:
   the separation is what stops a loud Maintainability haul from burying the one Bugs blocker.
 - **Not fixed** — `UNJUDGED` findings, plus any fix that failed or escalated. These are the user's.
 - **Discrepancies** — epic spec vs. what was delivered.
-- **HITL escalations** — every unit of work that stopped short of landing and why, or "none".
+- **HITL escalations** — every unit of work that stopped short of landing and why, plus any foreign
+  commit or concurrent run the preflight saw, or "none".
 
 Close with the epic comment's URL. If `epicComment.posted` is false, say so and paste
 `epicComment.body` — the record has to land somewhere, and the terminal is the fallback, not the plan.

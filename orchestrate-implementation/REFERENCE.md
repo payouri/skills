@@ -21,7 +21,7 @@ below rather than referenced, because a Workflow script must be self-contained.
 {
   "epic": 42,
   "repo": "owner/repo",
-  "repoPath": "/abs/path/to/primary/checkout",
+  "repoPath": "/abs/path/to/this/runs/worktree",
   "featureBranch": "feature/epic-42",
   "baseBranch": "trunk",
   "baseSha": "9f2c1ab",
@@ -29,9 +29,11 @@ below rather than referenced, because a Workflow script must be self-contained.
 }
 ```
 
-`repoPath` is the primary checkout where `featureBranch` is checked out — the only place the
-integrator runs `git merge`. Workflow B additionally takes `findings`. Add `retryAfterMs` when a
-previous run surfaced a `Retry-After` header; it becomes the backoff floor.
+`repoPath` is **this run's own worktree**, created in step 0, where `featureBranch` is checked out and
+stays checked out — the only place the integrator runs `git merge`, and never the primary clone,
+whose HEAD belongs to the user and to any other orchestration sharing the repo. Workflow B
+additionally takes `findings`. Add `retryAfterMs` when a previous run surfaced a `Retry-After`
+header; it becomes the backoff floor.
 
 **`baseBranch` is a name; `baseSha` is the fixed point.** The base branch is whatever this repo
 integrates into — `trunk`, `main`, a release branch, a parent feature branch — resolved in step 0, and
@@ -250,7 +252,15 @@ while (round < MAX_ROUNDS) {
           `NOT fall back to ${PROTECTED_BRANCHES.join('/')}, or any invented branch name, no matter how ` +
           `plausible it looks. If it exists, create a git worktree for this sub-task at ${repoPath}/../wt-subtask-${task.number} ` +
           `on new branch subtask-${task.number} based on ${featureBranch}, set ok=true, and return the ` +
-          `worktree path and branch name.`,
+          `worktree path and branch name.\n\n` +
+          `If that path already exists on disk, a previous run died there. You are authorized to clear it, ` +
+          `but ONLY when both hold: it is NOT registered in "git worktree list", AND it holds nothing but ` +
+          `regenerable build output (node_modules, .vite, dist, target, build caches). Check with ` +
+          `"find <path> -type f | head -50" before you touch it. Anything that could be source or ` +
+          `uncommitted work — any tracked file type, any .git — is an escalation rather than a cleanup: ` +
+          `set ok=false naming what you found, and let a human look. Keep the path derived from the issue ` +
+          `number whatever happens; a second location for one sub-task is how two worktrees end up ` +
+          `half-implementing it.`,
         { phase: 'Claim', schema: CLAIM_SCHEMA, label: `claim:${task.number}` }
       ),
     (claim, task) => {
@@ -304,17 +314,22 @@ while (round < MAX_ROUNDS) {
 
   phase('Integrate')
   const integration = await tryAgent(
-    `You are the sole integrator for this round. Work in the primary checkout ${repoPath}, where ` +
+    `You are the sole integrator for this round. Work in this run's own worktree ${repoPath}, where ` +
       `${featureBranch} is checked out. Handle the sub-task branches below ONE AT A TIME, in the order ` +
       `listed — never in parallel, never in a worktree.\n\n` +
       ready
         .map((r) => `- #${r.number} "${r.title}" · branch ${r.branch} · commit ${r.commitSha} · worktree ${r.worktreePath}\n  summary: ${r.summary}`)
         .join('\n') +
       `\n\nFor each, in order:\n` +
-      `1. Re-verify the merge target: git -C ${repoPath} rev-parse --verify ${featureBranch}. The ONLY ` +
+      `1. Re-verify the merge target TWICE. First that it exists: git -C ${repoPath} rev-parse --verify ` +
+      `${featureBranch}. Then — the one that matters — that it is the branch actually CHECKED OUT there: ` +
+      `git -C ${repoPath} rev-parse --abbrev-ref HEAD must print exactly "${featureBranch}". Existence is ` +
+      `not enough: "git merge" lands on whatever HEAD points at, so a branch that exists but is checked out ` +
+      `nowhere means your merge silently lands this work on a DIFFERENT branch. The ONLY ` +
       `valid target is the exact branch "${featureBranch}" — it is never ${PROTECTED_BRANCHES.join('/')} ` +
-      `and you must never substitute one of those or invent a different name, even as a fallback. If it is missing or ` +
-      `looks wrong, STOP the whole round and report hitl.triggered=true on every remaining sub-task.\n` +
+      `and you must never substitute one of those or invent a different name, even as a fallback, and you ` +
+      `must never run "git checkout" to make HEAD match. If it is missing, or HEAD is anything else, ` +
+      `STOP the whole round and report hitl.triggered=true on every remaining sub-task.\n` +
       `2. Rebase the sub-task branch onto ${featureBranch}, squashed to one tidy commit.\n` +
       `3. If the rebase conflicts AT ALL: git rebase --abort, leave the branch and worktree in place, ` +
       `leave the issue OPEN and assigned, set landed=false and hitl.triggered=true with the conflicting ` +
@@ -624,7 +639,12 @@ const fixes = groups.length
           `You did not write this code and you did not raise these findings.\n\n` +
           `Create a worktree at ${repoPath}/../wt-${g.slug} on new branch ${g.slug} based on ` +
           `${featureBranch}, and work only there. Do NOT touch ${featureBranch} itself and do NOT merge ` +
-          `anything — a serial integrator lands your branch afterwards.\n\n` +
+          `anything — a serial integrator lands your branch afterwards. If that worktree path already ` +
+          `exists on disk, a previous run died there: you may clear it ONLY when it is absent from ` +
+          `"git worktree list" AND holds nothing but regenerable build output (node_modules, .vite, dist, ` +
+          `target). Check with "find <path> -type f | head -50" first; anything that could be source or ` +
+          `uncommitted work is an escalation — set hitl.triggered=true naming what you found. Keep the ` +
+          `path as given rather than relocating around the collision.\n\n` +
           `Findings, all in ${g.file}:\n${renderFindings(g.findings)}\n\n` +
           `For each: reproduce the failure from the code before changing anything. Make the smallest change ` +
           `that removes the defect and add or extend a test that would have caught it, unless the repo has no ` +
@@ -660,13 +680,17 @@ fixes.forEach((r, i) => {
 if (ready.length) {
   phase('Integrate fixes')
   const integration = await tryAgent(
-    `You are the sole integrator for the fix branches below. Work in the primary checkout ${repoPath}, ` +
+    `You are the sole integrator for the fix branches below. Work in this run's own worktree ${repoPath}, ` +
       `where ${featureBranch} is checked out. Handle them ONE AT A TIME, in the order listed.\n\n` +
       ready.map((r) => `- ${r.key} · branch ${r.branch} · commit ${r.commitSha} · file ${r.file} · fixed ${r.fixed.join(', ') || 'nothing'}`).join('\n') +
       `\n\nFor each, in order:\n` +
-      `1. Re-verify the target with git -C ${repoPath} rev-parse --verify ${featureBranch}. The ONLY valid ` +
-      `target is that exact branch — never ${PROTECTED_BRANCHES.join('/')}, never an invented fallback. If it is missing ` +
-      `or wrong, STOP and report hitl.triggered=true for every remaining branch.\n` +
+      `1. Re-verify the target TWICE: git -C ${repoPath} rev-parse --verify ${featureBranch} for existence, ` +
+      `then git -C ${repoPath} rev-parse --abbrev-ref HEAD, which must print exactly "${featureBranch}". ` +
+      `"git merge" lands on HEAD, so a branch that exists but is checked out nowhere means your merge ` +
+      `silently lands on a DIFFERENT branch. The ONLY valid ` +
+      `target is that exact branch — never ${PROTECTED_BRANCHES.join('/')}, never an invented fallback, and ` +
+      `never a "git checkout" to make HEAD match. If it is missing, or HEAD is anything else, ` +
+      `STOP and report hitl.triggered=true for every remaining branch.\n` +
       `2. Skip any branch whose fixed list is empty and whose commit is unchanged from ${featureBranch} — ` +
       `report landed=false with that as the reason, not as a HITL.\n` +
       `3. Rebase the fix branch onto ${featureBranch}, squashed to one commit. On ANY conflict: ` +
@@ -893,6 +917,13 @@ implementations committed, integration dead" (Workflow A) or "all fixes committe
    the string it receives is not.
 6. **If the failure was rate/overload-driven, pass `retryAfterMs`** from whatever the provider asked
    for, and consider fewer sub-tasks per round.
+7. **A stale worktree path outlives the worktree.** `git worktree remove --force` unregisters it, but
+   build tooling can rewrite `node_modules`/`.vite`/`dist` into the path afterwards, and
+   `git worktree add` refuses a non-empty directory — so a clean `git worktree list` is not evidence
+   the directory is gone. `find <path> -type f` before the next run claims that sub-task.
+8. **Restarting fresh rather than resuming? Seed what already landed** into `landed` with real SHAs.
+   Closed issues never come back from Discover, but their commits are still on the branch and still
+   inside act 2's diff.
 
 Acts are separately resumable: if act 2's review completed and Workflow B died, re-run Workflow B
 alone with the same `findings` — act 1's work is already on the branch.
@@ -912,7 +943,21 @@ alone with the same `findings` — act 1's work is already on the branch.
   code the epic never wrote or skips code it did. So step 0 captures `git rev-parse <featureBranch>`
   *before the first sub-task lands* and every measurement — act 2's diff, act 3's discrepancy check —
   uses that SHA. `baseBranch` survives only as a name: for creating the branch, and for the protected
-  set the integrator must refuse to merge into.
+  set the integrator must refuse to merge into. Know what the pin does *not* buy: it fixes the base
+  against drift, and cannot stop a foreign commit landing on the feature branch itself. That needs its
+  own check — act 2 compares `baseSha..HEAD` against act 1's `landed` SHAs and reports the difference
+  rather than halting on it, since an unreviewed branch is worse than an annotated one.
+- **The run owns its checkout; it does not borrow the primary clone.** An earlier draft had the
+  feature branch checked out in the primary repo for the whole run, which silently assumed exclusive
+  ownership of a HEAD that belongs to the user and to any other orchestration in the same repo. Two
+  runs **racing** one HEAD is not a rare interleaving: observed in practice, a concurrent epic's
+  integrator merged its sub-task onto *this* epic's branch and then committed a second one there,
+  while this run's next merge would have landed on *its* branch — each run writing to whichever
+  branch the other last checked out, discovered only by reading the reflog afterwards. Detection is
+  the wrong instrument here, because the window between checking HEAD and merging is exactly where
+  the race lives. A dedicated worktree removes the shared resource instead, which is why `repoPath`
+  is a worktree the run creates and why the preflight in step 0 only *reports* concurrent runs — once
+  the checkout isn't shared, another run is a curiosity rather than a threat.
 - **The refute stage is why fixes can be automated.** A per-sub-task reviewer that also fixed what it
   found was its own judge — nothing tested whether the finding was real before the code changed.
   `/adversarial-code-review` runs a fresh refuter per lens that never sees the attacker's reasoning, so
@@ -924,7 +969,7 @@ alone with the same `findings` — act 1's work is already on the branch.
   dies, the tier defaults to `opus` — over-spending on a fix is recoverable; a botched fix on a branch
   nobody will review again is not.
 - **Integration is serial and never resolves conflicts.** Only one agent writes to the feature branch,
-  one branch at a time, in the primary checkout. Concurrent `--ff-only` merges against a moving ref
+  one branch at a time, in the run's own worktree. Concurrent `--ff-only` merges against a moving ref
   produce lost updates and conflicts that are artifacts of the schedule rather than the code. And an
   integrator that resolves conflicts is making semantic decisions about code it has not read, in the
   one place where a wrong guess is invisible — so a conflict aborts to HITL, always.
