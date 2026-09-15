@@ -6,9 +6,13 @@ A collection of agent skills.
 
 - [orchestrate-implementation](orchestrate-implementation/SKILL.md) — Orchestrate implementation of an epic/task and its open sub-tasks end-to-end using parallel sub-agents in isolated git worktrees, with strict implement/review separation, per-tier model selection, and HITL escalation on risk.
 - [orchestrate-backlog](orchestrate-backlog/SKILL.md) — Same fleet machinery aimed at the whole tracker instead of one epic: drains every open `ready-for-agent` issue, 4 tasks in flight at a time, landing each on its own branch without merging, pushing, or closing anything.
+- [adversarial-code-review](adversarial-code-review/SKILL.md) — Red-team a diff one lens at a time (Bugs, Maintainability, Security, Standards, Spec), then refute every finding before it reaches you. Ships its own `rulebooks/`.
 - [research-dossier](research-dossier/SKILL.md) — Compile any topic into an evidence-graded dossier (guide, rulebook, sources) filed under one directory of the research repo and summarised in its README.
 
 The two orchestrators are siblings and share their failure-handling design — read both before changing either.
+
+`orchestrate-implementation` runs `adversarial-code-review` as its act 2, so linking the orchestrator
+without it leaves a fleet that builds and repairs but never reviews. Link both.
 
 ## Installing
 
@@ -18,5 +22,6 @@ copying it, so edits here take effect immediately:
 ```bash
 ln -s "$PWD/orchestrate-implementation" ~/.claude/skills/orchestrate-implementation
 ln -s "$PWD/orchestrate-backlog"        ~/.claude/skills/orchestrate-backlog
+ln -s "$PWD/adversarial-code-review"    ~/.claude/skills/adversarial-code-review
 ln -s "$PWD/research-dossier"           ~/.claude/skills/research-dossier
 ```
